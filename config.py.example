@@ -1,0 +1,46 @@
+"""
+Template configuration for the Photos -> OneDrive backup.
+Rename this file to `config.py` and fill in your credentials.
+"""
+
+import os
+
+# --- Paths ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKENS_DIR = os.path.join(BASE_DIR, ".tokens")
+LOG_FILE = os.path.join(BASE_DIR, "backup.log")
+TEMP_DIR = os.path.join(BASE_DIR, ".tmp_download")
+
+# --- Google Photos ---
+# Get credentials from: https://console.cloud.google.com/
+GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID"
+GOOGLE_CLIENT_SECRET = "YOUR_GOOGLE_CLIENT_SECRET"
+GOOGLE_TOKEN_FILE = os.path.join(TOKENS_DIR, "google_token.json")
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/photoslibrary.readonly"]
+
+# --- Microsoft OneDrive ---
+# Get credentials from: https://portal.azure.com/
+MICROSOFT_CLIENT_ID = "YOUR_MICROSOFT_CLIENT_ID"
+MICROSOFT_TENANT_ID = "consumers"
+MICROSOFT_TOKEN_FILE = os.path.join(TOKENS_DIR, "microsoft_token.json")
+MICROSOFT_SCOPES = ["Files.ReadWrite"]
+
+# --- OneDrive Folder Structure ---
+# Example: Immagini/Memorie/2026/04.Aprile 2026
+ONEDRIVE_ROOT_FOLDER = "Immagini/Memorie"
+
+# --- Telegram ---
+# Create a bot via @BotFather to get your token and chat ID.
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+
+# --- Concurrency ---
+CONCURRENT_UPLOADS = 4
+CONCURRENT_DELETES = 3
+
+# --- Month Names ---
+MONTHS = {
+    1: "Gennaio", 2: "Febbraio", 3: "Marzo", 4: "Aprile",
+    5: "Maggio", 6: "Giugno", 7: "Luglio", 8: "Agosto",
+    9: "Settembre", 10: "Ottobre", 11: "Novembre", 12: "Dicembre",
+}

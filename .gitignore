@@ -1,0 +1,15 @@
+# General
+.DS_Store
+__pycache__/
+*.pyc
+
+# Project Specific
+.tokens/
+.chrome_session/
+.tmp_download/
+backup.log
+debug_screenshot.png
+
+# Configuration (contains secrets)
+config.py
+*.*.plist
