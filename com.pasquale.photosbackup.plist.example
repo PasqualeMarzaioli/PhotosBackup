@@ -8,7 +8,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <string>__PYTHON_PATH__</string>
         <string>__PROJECT_PATH__/backup.py</string>
     </array>
 

@@ -6,6 +6,8 @@ Handles MSAL authentication and file uploads (including large files with upload 
 import os
 import logging
 import requests
+import threading
+import urllib.parse
 
 import msal
 
@@ -15,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 _AUTHORITY = f"https://login.microsoftonline.com/{config.MICROSOFT_TENANT_ID}"
+
+# Cache for folder IDs to prevent race conditions and excessive API calls
+_folder_id_cache = {}
+_folder_id_cache_lock = threading.Lock()
 
 # Threshold to use upload session (files > 4 MB)
 _LARGE_FILE_THRESHOLD = 4 * 1024 * 1024
@@ -63,39 +69,67 @@ def _ensure_folder(token: str, folder_path: str) -> str:
     """
     Recursively creates the folder structure on OneDrive if it does not exist.
     Returns the leaf folder ID.
+    Thread-safe and uses in-memory caching to avoid API calls and race conditions.
     """
+    with _folder_id_cache_lock:
+        if folder_path in _folder_id_cache:
+            return _folder_id_cache[folder_path]
+
     parts = [p for p in folder_path.split("/") if p]
     parent_id = "root"
+    path_so_far = ""
 
     for part in parts:
-        url = f"{_GRAPH_BASE}/me/drive/items/{parent_id}/children"
+        path_so_far = f"{path_so_far}/{part}" if path_so_far else part
+        
+        with _folder_id_cache_lock:
+            if path_so_far in _folder_id_cache:
+                parent_id = _folder_id_cache[path_so_far]
+                continue
+
+        encoded_part = urllib.parse.quote(part)
+        url = f"{_GRAPH_BASE}/me/drive/items/{parent_id}:/{encoded_part}"
         resp = requests.get(url, headers=_headers(token), timeout=30)
-        resp.raise_for_status()
+        
+        found_id = None
+        if resp.status_code == 200:
+            item = resp.json()
+            if "folder" in item:
+                found_id = item["id"]
+        elif resp.status_code != 404:
+            resp.raise_for_status()
 
-        items = resp.json().get("value", [])
-        found_item = next((item for item in items if item.get("name", "").lower() == part.lower() and "folder" in item), None)
-
-        if found_item:
-            parent_id = found_item["id"]
+        if found_id:
+            parent_id = found_id
         else:
-            # Create folder
-            body = {"name": part, "folder": {}, "@microsoft.graph.conflictBehavior": "rename"}
+            # Create folder (with fail conflict behavior, handles race condition via try-get fallback)
+            body = {"name": part, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}
             resp = requests.post(
                 f"{_GRAPH_BASE}/me/drive/items/{parent_id}/children",
                 headers={**_headers(token), "Content-Type": "application/json"},
                 json=body,
                 timeout=30,
             )
-            resp.raise_for_status()
-            parent_id = resp.json()["id"]
-            logger.info(f"Folder created: {part}")
+            if resp.status_code == 409 or (resp.status_code == 400 and "alreadyExists" in resp.text):
+                # Retrieve the ID of the folder that was created concurrently
+                resp = requests.get(url, headers=_headers(token), timeout=30)
+                resp.raise_for_status()
+                parent_id = resp.json()["id"]
+            else:
+                resp.raise_for_status()
+                parent_id = resp.json()["id"]
+                logger.info(f"Folder created: {part}")
+
+        with _folder_id_cache_lock:
+            _folder_id_cache[path_so_far] = parent_id
 
     return parent_id
 
 
 def _upload_small(token: str, folder_id: str, filename: str, filepath: str) -> bool:
     """Simple upload for files <= 4 MB."""
-    url = f"{_GRAPH_BASE}/me/drive/items/{folder_id}:/{filename}:/content"
+    encoded_filename = urllib.parse.quote(filename)
+    url = f"{_GRAPH_BASE}/me/drive/items/{folder_id}:/{encoded_filename}:/content"
     with open(filepath, "rb") as f:
         data = f.read()
     resp = requests.put(
@@ -115,7 +149,8 @@ def _upload_large(token: str, folder_id: str, filename: str, filepath: str) -> b
     file_size = os.path.getsize(filepath)
 
     # Create upload session
-    url = f"{_GRAPH_BASE}/me/drive/items/{folder_id}:/{filename}:/createUploadSession"
+    encoded_filename = urllib.parse.quote(filename)
+    url = f"{_GRAPH_BASE}/me/drive/items/{folder_id}:/{encoded_filename}:/createUploadSession"
     body = {"item": {"@microsoft.graph.conflictBehavior": "replace", "name": filename}}
     resp = requests.post(
         url,
@@ -151,7 +186,8 @@ def _upload_large(token: str, folder_id: str, filename: str, filepath: str) -> b
 
 def file_exists_on_onedrive(token: str, folder_id: str, filename: str) -> bool:
     """Checks if the file already exists on OneDrive (avoids duplicates)."""
-    url = f"{_GRAPH_BASE}/me/drive/items/{folder_id}:/{filename}"
+    encoded_filename = urllib.parse.quote(filename)
+    url = f"{_GRAPH_BASE}/me/drive/items/{folder_id}:/{encoded_filename}"
     resp = requests.get(url, headers=_headers(token), timeout=15)
     return resp.status_code == 200
 

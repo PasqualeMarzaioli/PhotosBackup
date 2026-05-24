@@ -102,7 +102,7 @@ def download_photos_for_month(
             photo_links = page.query_selector_all('a[data-photo-id], div[data-media-key], a[href*="/photo/"]')
             current_count = len(photo_links)
 
-            if current_count > 0 and current_count == prev_count:
+            if current_count == prev_count:
                 scroll_attempts += 1
                 if scroll_attempts >= 3:
                     break
@@ -121,6 +121,13 @@ def download_photos_for_month(
         photo_urls = []
         for el in photo_elements:
             href = el.get_attribute("href")
+            if not href:
+                try:
+                    parent = el.query_selector("xpath=ancestor::a[contains(@href, '/photo/')]")
+                    if parent:
+                        href = parent.get_attribute("href")
+                except Exception:
+                    pass
             if href and "/photo/" in href:
                 full_url = href if href.startswith("http") else f"https://photos.google.com{href}"
                 if full_url not in photo_urls:
@@ -251,9 +258,21 @@ def delete_photos_from_google(items: list[dict]) -> None:
                     tab.keyboard.press("#")
                     time.sleep(0.5)
                     tab.keyboard.press("Enter")
-                    time.sleep(1)
-                    print("DONE")
-                    deleted_count += 1
+                    
+                    # Verify deletion: wait for URL to change (Google Photos navigates to next photo on delete)
+                    deletion_verified = False
+                    for _ in range(3): # Wait up to 3 seconds
+                        time.sleep(1)
+                        if tab.url != url:
+                            deletion_verified = True
+                            break
+                    
+                    if deletion_verified:
+                        print("DONE")
+                        deleted_count += 1
+                    else:
+                        print("FAILED (URL did not change, probably not deleted)")
+                        error_count += 1
                 except Exception as e:
                     print(f"ERROR: {e}")
                     error_count += 1
@@ -281,9 +300,10 @@ if __name__ == "__main__":
         year = int(sys.argv[1])
         month = int(sys.argv[2])
     else:
+        # Default: previous month, aligned with backup.py
         now = datetime.now()
-        year = now.year
-        month = now.month
+        month = now.month - 1 if now.month > 1 else 12
+        year = now.year if now.month > 1 else now.year - 1
 
     if not 1 <= month <= 12:
         print(f"Invalid month: {month}")

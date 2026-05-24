@@ -7,6 +7,7 @@ import json
 import os
 import logging
 import requests
+import calendar
 from datetime import datetime
 from typing import Optional
 
@@ -53,6 +54,7 @@ def get_photos_for_month(year: int, month: int) -> list[dict]:
     headers = {"Authorization": f"Bearer {creds.token}"}
 
     url = "https://photoslibrary.googleapis.com/v1/mediaItems:search"
+    last_day = calendar.monthrange(year, month)[1]
     payload = {
         "pageSize": 100,
         "filters": {
@@ -60,7 +62,7 @@ def get_photos_for_month(year: int, month: int) -> list[dict]:
                 "ranges": [
                     {
                         "startDate": {"year": year, "month": month, "day": 1},
-                        "endDate": {"year": year, "month": month, "day": 31},
+                        "endDate": {"year": year, "month": month, "day": last_day},
                     }
                 ]
             },

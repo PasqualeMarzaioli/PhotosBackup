@@ -18,9 +18,15 @@ echo "=============================================="
 # 1. Install Python dependencies
 echo ""
 echo "-> Installing Python dependencies..."
-pip3 install -r "$SCRIPT_DIR/requirements.txt" --quiet
+PYTHON_BIN=$(which python3.11 || which python3 || echo "python3")
+
+if ! "$PYTHON_BIN" -m pip install -r "$SCRIPT_DIR/requirements.txt" --quiet; then
+    echo "  System Python is externally managed. Retrying with --break-system-packages --user..."
+    "$PYTHON_BIN" -m pip install -r "$SCRIPT_DIR/requirements.txt" --break-system-packages --user --quiet
+fi
+
 echo "-> Installing browser for Playwright..."
-playwright install chromium
+"$PYTHON_BIN" -m playwright install chromium
 echo "  Dependencies installed."
 
 # 2. Create tokens directory (with restricted permissions)
@@ -32,8 +38,12 @@ mkdir -p "$SCRIPT_DIR/.tmp_download"
 echo ""
 echo "-> Configuring and Installing macOS LaunchAgent..."
 
-# Generate the real plist from the example by replacing the path placeholder
-sed "s|__PROJECT_PATH__|$SCRIPT_DIR|g" "$SCRIPT_DIR/com.pasquale.photosbackup.plist.example" > "$SCRIPT_DIR/$PLIST_NAME"
+# Find the Python path used (preferring Python 3.11 if available)
+PYTHON_PATH=$(which python3.11 || which python3 || echo "/usr/bin/python3")
+echo "  Using Python path for LaunchAgent: $PYTHON_PATH"
+
+# Generate the real plist from the example by replacing path and python placeholders
+sed -e "s|__PROJECT_PATH__|$SCRIPT_DIR|g" -e "s|__PYTHON_PATH__|$PYTHON_PATH|g" "$SCRIPT_DIR/com.pasquale.photosbackup.plist.example" > "$SCRIPT_DIR/$PLIST_NAME"
 
 mkdir -p "$LAUNCH_AGENTS_DIR"
 cp "$SCRIPT_DIR/$PLIST_NAME" "$LAUNCH_AGENTS_DIR/$PLIST_NAME"
