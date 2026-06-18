@@ -420,14 +420,14 @@ def download_photos_for_month(
     return downloaded_files
 
 
-def delete_photos_from_google(items: list[dict]) -> None:
+def delete_photos_from_google(items: list[dict]) -> dict:
     """
     Move Google Photos items to trash using the browser shortcut.
 
     Processes CONCURRENT_DELETES items at a time using separate tabs.
     """
     if not items:
-        return
+        return {"requested": 0, "deleted": 0, "errors": 0}
 
     from playwright.sync_api import sync_playwright
 
@@ -460,6 +460,7 @@ def delete_photos_from_google(items: list[dict]) -> None:
                 for item in batch:
                     url = item.get("google_url")
                     if not url:
+                        error_count += 1
                         continue
                     tab = context.new_page()
                     tabs.append((tab, item, url))
@@ -518,6 +519,7 @@ def delete_photos_from_google(items: list[dict]) -> None:
     if error_count > 0:
         print(f"  Errors: {error_count}")
     print(f"{'=' * 60}\n")
+    return {"requested": len(items), "deleted": deleted_count, "errors": error_count}
 
 
 if __name__ == "__main__":

@@ -45,6 +45,66 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _remove_runtime_path(path: str) -> bool:
+    """Remove a generated runtime path if it exists."""
+    if not os.path.exists(path):
+        return False
+
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+        logger.info(f"Cleaned runtime artifact: {path}")
+        return True
+    except Exception as exc:
+        logger.warning(f"Could not clean runtime artifact {path}: {exc}")
+        return False
+
+
+def cleanup_runtime_artifacts() -> int:
+    """
+    Remove generated cache files after a fully successful backup run.
+
+    This intentionally preserves credentials, browser login state, logs,
+    configuration, and the virtual environment.
+    """
+    if not bool(getattr(config, "CLEAN_RUNTIME_ARTIFACTS_AFTER_SUCCESS", True)):
+        logger.info("Post-success runtime cleanup is disabled by configuration.")
+        return 0
+
+    base_dir = getattr(config, "BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
+    paths = [
+        os.path.join(base_dir, "__pycache__"),
+        os.path.join(base_dir, "tests", "__pycache__"),
+        getattr(config, "TEMP_DIR", os.path.join(base_dir, ".tmp_download")),
+    ]
+
+    if bool(getattr(config, "CLEAN_CHROME_CACHE_AFTER_SUCCESS", True)):
+        session_dir = getattr(download_photos, "SESSION_DIR", os.path.join(base_dir, ".chrome_session"))
+        cache_paths = [
+            "Default/Cache",
+            "Default/Code Cache",
+            "Default/GPUCache",
+            "Default/DawnGraphiteCache",
+            "Default/DawnWebGPUCache",
+            "GrShaderCache",
+            "GraphiteDawnCache",
+            "ShaderCache",
+            "GPUPersistentCache/GPUCache",
+            "optimization_guide_model_store",
+        ]
+        paths.extend(os.path.join(session_dir, cache_path) for cache_path in cache_paths)
+
+    cleaned_count = 0
+    for path in paths:
+        if _remove_runtime_path(path):
+            cleaned_count += 1
+
+    logger.info(f"Post-success runtime cleanup completed. Removed paths: {cleaned_count}")
+    return cleaned_count
+
+
 def send_telegram(message: str) -> None:
     token = getattr(config, "TELEGRAM_BOT_TOKEN", "")
     chat_id = getattr(config, "TELEGRAM_CHAT_ID", "")
@@ -187,17 +247,26 @@ def run_backup(year: int, month: int) -> None:
         if download_error_count > 10:
             logger.error(f"  ... plus {download_error_count - 10} more download errors")
 
-    total_error_count = error_count + download_error_count
+    pre_delete_error_count = error_count + download_error_count
+    deletion_error_count = 0
 
     # 3. Delete from Google Photos (concurrent tabs)
     should_delete = bool(getattr(config, "DELETE_AFTER_UPLOAD", True))
     partial_delete_allowed = bool(getattr(config, "DELETE_ON_PARTIAL_SUCCESS", False))
-    if successful_items and should_delete and (total_error_count == 0 or partial_delete_allowed):
+    if successful_items and should_delete and (pre_delete_error_count == 0 or partial_delete_allowed):
         logger.info(f"Deleting {len(successful_items)} items from Google Photos...")
         try:
-            download_photos.delete_photos_from_google(successful_items)
+            delete_result = download_photos.delete_photos_from_google(successful_items)
+            deletion_error_count = int(delete_result.get("errors", 0))
+            deleted_count = int(delete_result.get("deleted", 0))
+            requested_delete_count = int(delete_result.get("requested", len(successful_items)))
+            if deleted_count != requested_delete_count:
+                deletion_error_count += max(0, requested_delete_count - deleted_count - deletion_error_count)
+            if deletion_error_count:
+                logger.error(f"Google Photos deletion errors: {deletion_error_count}")
         except Exception as e:
             logger.error(f"Error deleting from Google Photos: {e}")
+            deletion_error_count = len(successful_items)
     elif successful_items and should_delete:
         logger.warning(
             "Google Photos deletion skipped because the run had errors. "
@@ -206,20 +275,27 @@ def run_backup(year: int, month: int) -> None:
     elif successful_items:
         logger.info("Google Photos deletion is disabled by configuration.")
 
-    # Clean up temporary directory
+    total_error_count = pre_delete_error_count + deletion_error_count
+
+    # Clean up generated runtime files only after a fully successful run.
+    if total_error_count == 0:
+        cleanup_runtime_artifacts()
+    elif os.path.exists(temp_dir):
+        logger.warning(f"Temporary files kept for inspection: {temp_dir}")
+
+    # Keep this fallback for configurations that disable the broad cleanup helper.
     if total_error_count == 0 and os.path.exists(temp_dir):
         try:
             shutil.rmtree(temp_dir)
         except Exception:
             pass
-    elif os.path.exists(temp_dir):
-        logger.warning(f"Temporary files kept for inspection: {temp_dir}")
 
     logger.info("=" * 60)
     logger.info(f"BACKUP COMPLETED: {month_name} {year}")
     logger.info(f"  Successfully uploaded : {success_count}")
     logger.info(f"  Upload errors         : {error_count}")
     logger.info(f"  Download errors       : {download_error_count}")
+    logger.info(f"  Deletion errors       : {deletion_error_count}")
     logger.info(f"  Errors                : {total_error_count}")
     logger.info("=" * 60)
 
@@ -240,6 +316,7 @@ def run_backup(year: int, month: int) -> None:
             f"Uploaded: {success_count}\n"
             f"Upload errors: {error_count}\n"
             f"Download errors: {download_error_count}\n\n"
+            f"Deletion errors: {deletion_error_count}\n\n"
             f"Google Photos deletion was skipped unless DELETE_ON_PARTIAL_SUCCESS is enabled."
         )
 

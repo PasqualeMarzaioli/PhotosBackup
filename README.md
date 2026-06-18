@@ -90,6 +90,8 @@ The browser downloader and OneDrive uploader are intentionally conservative:
 - `MUTE_BROWSER_AUDIO`: Opens Google Photos media pages without video/audio playback sound.
 - `DELETE_AFTER_UPLOAD`: Enables automatic deletion from Google Photos after a successful backup.
 - `DELETE_ON_PARTIAL_SUCCESS`: Defaults to `False`; when a run has download or upload errors, Google Photos deletion is skipped.
+- `CLEAN_RUNTIME_ARTIFACTS_AFTER_SUCCESS`: Removes temporary files and Python caches after a fully successful run.
+- `CLEAN_CHROME_CACHE_AFTER_SUCCESS`: Removes Chrome cache folders while preserving the saved Google login session.
 
 ---
 
@@ -168,6 +170,7 @@ All backups are recorded in `backup.log`:
 2026-04-02 09:01:22  INFO       Successfully uploaded : 47
 2026-04-02 09:01:22  INFO       Upload errors         : 0
 2026-04-02 09:01:22  INFO       Download errors       : 0
+2026-04-02 09:01:22  INFO       Deletion errors       : 0
 2026-04-02 09:01:22  INFO       Errors                : 0
 ```
 
@@ -184,3 +187,4 @@ All backups are recorded in `backup.log`:
 - If the Mac is turned off on the scheduled day, the daily checker catches up when the Mac is available again.
 - Google Photos deletion is skipped when any download or upload error occurs, unless `DELETE_ON_PARTIAL_SUCCESS` is explicitly enabled.
 - Temporary files are automatically deleted only after a fully successful run; failed runs keep them for inspection.
+- After a fully successful run, runtime cleanup removes `.tmp_download`, Python bytecode caches, and Chrome cache directories without deleting tokens, logs, configuration, the virtual environment, or the browser login session.
