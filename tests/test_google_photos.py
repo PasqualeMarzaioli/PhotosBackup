@@ -1,3 +1,9 @@
+"""
+Tests the optional Google Photos Library API helpers.
+
+Author: Pasquale Marzaioli
+"""
+
 import unittest
 from unittest.mock import patch, mock_open, MagicMock
 import os

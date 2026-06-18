@@ -1,4 +1,8 @@
 """
+Sets up browser and Microsoft authentication for the backup tools.
+
+Author: Pasquale Marzaioli
+
 Setup script: authenticates the user on Google Photos and Microsoft OneDrive
 and securely saves the tokens for future automated backups.
 
@@ -130,4 +134,4 @@ if __name__ == "__main__":
         exit(1)
 
     verify_setup()
-    print("Setup completed! Automatic backup is enabled for the 2nd of each month.")
+    print("Setup completed! The daily checker can now run the monthly backup when needed.")

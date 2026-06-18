@@ -1,32 +1,276 @@
 """
-Downloads photos from Google Photos using Playwright with a real Chrome instance.
-The first time, manual login is required. Subsequent sessions reuse the saved session.
+Downloads Google Photos media through a persistent browser session.
 
-Supports:
-  - on_downloaded callback for pipeline upload (upload starts as photos download)
-  - Concurrent deletion using multiple browser tabs
+Author: Pasquale Marzaioli
 
-Usage:
-    python3 download_photos.py              # download current month's photos
-    python3 download_photos.py 2026 4       # download photos for April 2026
+Downloads media from Google Photos using Playwright with a persistent Chrome
+profile. The first run requires a manual login; later runs reuse the saved
+browser session.
+
+The browser route is intentionally kept as the active downloader because the
+Google Photos Library API is not reliable for a full personal-library backup.
 """
 
-import glob
+import calendar
+import hashlib
 import os
-import shutil
 import sys
 import time
+import urllib.parse
 from datetime import datetime
 from typing import Callable, Optional
 
 import config
 
-# --- Configuration ------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SESSION_DIR = os.path.join(BASE_DIR, ".chrome_session")
-TEMP_DIR = os.path.join(BASE_DIR, ".tmp_download")
+TEMP_DIR = getattr(config, "TEMP_DIR", os.path.join(BASE_DIR, ".tmp_download"))
 
-# MONTHS is imported from config.py to ensure consistency across the project.
+_LAST_DOWNLOAD_ERRORS: list[str] = []
+
+
+def get_last_download_errors() -> list[str]:
+    """Return errors collected during the most recent download run."""
+    return list(_LAST_DOWNLOAD_ERRORS)
+
+
+def _cfg(name: str, default):
+    return getattr(config, name, default)
+
+
+def _browser_args() -> list[str]:
+    args = ["--disable-blink-features=AutomationControlled"]
+    if bool(_cfg("MUTE_BROWSER_AUDIO", True)):
+        args.append("--mute-audio")
+    return args
+
+
+def _wait(page, seconds: float) -> None:
+    try:
+        page.wait_for_timeout(int(seconds * 1000))
+    except Exception:
+        time.sleep(seconds)
+
+
+def _search_queries(year: int, month: int) -> list[str]:
+    queries = []
+    localized = f"{config.MONTHS[month]} {year}"
+    english = f"{calendar.month_name[month]} {year}"
+    for query in (localized, english):
+        if query and query not in queries:
+            queries.append(query)
+    return queries
+
+
+def _normalise_photo_url(url: str) -> Optional[str]:
+    if not url or "/photo/" not in url:
+        return None
+
+    parsed = urllib.parse.urlparse(url if url.startswith("http") else f"https://photos.google.com{url}")
+    photo_marker = "/photo/"
+    marker_index = parsed.path.find(photo_marker)
+    if marker_index < 0:
+        return None
+
+    photo_id = parsed.path[marker_index + len(photo_marker) :].split("/", 1)[0]
+    photo_id = urllib.parse.unquote(photo_id).strip()
+    if not photo_id:
+        return None
+
+    return f"https://photos.google.com/photo/{urllib.parse.quote(photo_id, safe='')}"
+
+
+def _photo_key(url: str) -> str:
+    canonical_url = _normalise_photo_url(url)
+    return canonical_url or url.split("#", 1)[0].split("?", 1)[0]
+
+
+def _photo_urls_from_page(page) -> list[str]:
+    script = """
+    () => {
+        const urls = new Set();
+        const add = (href) => {
+            if (!href || !href.includes('/photo/')) return;
+            urls.add(new URL(href, window.location.origin).href.split('#')[0].split('?')[0]);
+        };
+
+        document.querySelectorAll('a[href*="/photo/"]').forEach((el) => add(el.href));
+        document.querySelectorAll('[data-photo-id], [data-media-key], [data-latest-bg]').forEach((el) => {
+            const anchor = el.closest('a[href*="/photo/"]');
+            if (anchor) add(anchor.href);
+        });
+
+        return Array.from(urls);
+    }
+    """
+    urls: list[str] = []
+
+    try:
+        result = page.evaluate(script)
+        if isinstance(result, list):
+            urls.extend(result)
+    except Exception:
+        pass
+
+    if urls:
+        return list(dict.fromkeys(filter(None, (_normalise_photo_url(url) for url in urls))))
+
+    try:
+        elements = page.query_selector_all('a[href*="/photo/"]')
+    except Exception:
+        elements = []
+
+    for element in elements:
+        href = element.get_attribute("href")
+        full_url = _normalise_photo_url(href)
+        if full_url:
+            urls.append(full_url)
+
+    return list(dict.fromkeys(urls))
+
+
+def _scroll_metrics(page) -> Optional[dict]:
+    script = """
+    () => ({
+        scrollY: window.scrollY,
+        innerHeight: window.innerHeight,
+        scrollHeight: document.documentElement.scrollHeight || document.body.scrollHeight || 0
+    })
+    """
+    try:
+        metrics = page.evaluate(script)
+    except Exception:
+        return None
+    return metrics if isinstance(metrics, dict) else None
+
+
+def _scroll_down(page) -> None:
+    try:
+        page.evaluate("() => window.scrollBy(0, Math.max(window.innerHeight * 0.9, 700))")
+    except Exception:
+        page.keyboard.press("PageDown")
+
+
+def _mute_media_on_page(page) -> None:
+    if not bool(_cfg("MUTE_BROWSER_AUDIO", True)):
+        return
+
+    script = """
+    () => {
+        for (const media of document.querySelectorAll('video, audio')) {
+            media.muted = true;
+            media.volume = 0;
+        }
+    }
+    """
+    try:
+        page.evaluate(script)
+    except Exception:
+        pass
+
+
+def _collect_urls_while_scrolling(page) -> list[str]:
+    max_scrolls = int(_cfg("MAX_SCROLL_ATTEMPTS", 120))
+    idle_rounds = int(_cfg("SCROLL_IDLE_ROUNDS", 8))
+    pause_seconds = float(_cfg("SCROLL_PAUSE_SECONDS", 1.0))
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    stable_rounds = 0
+    previous_scroll_y = None
+    previous_scroll_height = None
+
+    for _ in range(max_scrolls):
+        before_count = len(seen)
+        for url in _photo_urls_from_page(page):
+            if url not in seen:
+                seen.add(url)
+                ordered.append(url)
+
+        metrics = _scroll_metrics(page)
+        if metrics:
+            scroll_y = float(metrics.get("scrollY", 0) or 0)
+            inner_height = float(metrics.get("innerHeight", 0) or 0)
+            scroll_height = float(metrics.get("scrollHeight", 0) or 0)
+            at_bottom = scroll_y + inner_height >= scroll_height - 40
+            did_not_move = (
+                previous_scroll_y == scroll_y
+                and previous_scroll_height == scroll_height
+            )
+            previous_scroll_y = scroll_y
+            previous_scroll_height = scroll_height
+        else:
+            at_bottom = True
+            did_not_move = True
+
+        if len(seen) == before_count and (at_bottom or did_not_move):
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+
+        if stable_rounds >= idle_rounds:
+            break
+
+        _scroll_down(page)
+        _wait(page, pause_seconds)
+
+    return ordered
+
+
+def _next_unique_filename(filename: str, used_names: set[str]) -> str:
+    safe_name = os.path.basename(filename or "").strip() or "google-photo"
+    root, ext = os.path.splitext(safe_name)
+    candidate = safe_name
+    counter = 2
+
+    while candidate.casefold() in used_names:
+        candidate = f"{root} ({counter}){ext}"
+        counter += 1
+
+    return candidate
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _download_one(page, photo_url: str, index: int, total: int, download_dir: str, used_names: set[str]) -> dict:
+    print(f"  [{index}/{total}] Downloading...", end=" ", flush=True)
+
+    page.goto(
+        photo_url,
+        wait_until="domcontentloaded",
+        timeout=int(_cfg("PHOTO_NAVIGATION_TIMEOUT_MS", 60000)),
+    )
+    _wait(page, 1.0)
+    _mute_media_on_page(page)
+
+    with page.expect_download(timeout=int(_cfg("DOWNLOAD_TIMEOUT_MS", 120000))) as download_info:
+        page.keyboard.press("Shift+D")
+
+    download = download_info.value
+    original_filename = os.path.basename(download.suggested_filename or f"google-photo-{index}")
+    upload_filename = _next_unique_filename(original_filename, used_names)
+    save_path = os.path.join(download_dir, upload_filename)
+
+    download.save_as(save_path)
+    if not os.path.exists(save_path) or os.path.getsize(save_path) == 0:
+        raise RuntimeError(f"Downloaded file is empty or missing: {upload_filename}")
+
+    used_names.add(upload_filename.casefold())
+    item = {
+        "local_path": save_path,
+        "google_url": photo_url,
+        "original_filename": original_filename,
+        "upload_filename": upload_filename,
+        "size": os.path.getsize(save_path),
+    }
+    print(f"OK: {upload_filename}")
+    return item
 
 
 def download_photos_for_month(
@@ -35,264 +279,245 @@ def download_photos_for_month(
     on_downloaded: Optional[Callable[[dict], None]] = None,
 ) -> list[dict]:
     """
-    Downloads photos for the specified month from Google Photos.
-    Returns a list of dicts with 'local_path' and 'google_url'.
+    Download media for the specified month from Google Photos.
 
-    If on_downloaded is provided, it is called immediately after each photo
-    is saved locally, enabling a pipeline where uploads start in parallel
-    while remaining photos are still being downloaded.
+    Returns dictionaries with local_path, google_url, original_filename,
+    upload_filename, and size. If on_downloaded is provided, it is called after
+    each file is saved locally so uploads can start immediately.
     """
     from playwright.sync_api import sync_playwright
 
+    global _LAST_DOWNLOAD_ERRORS
+    _LAST_DOWNLOAD_ERRORS = []
+
     month_name = config.MONTHS[month]
-    download_dir = os.path.join(TEMP_DIR, f"{year}_{month:02d}")
+    download_root = os.path.join(TEMP_DIR, f"{year}_{month:02d}")
+    download_dir = os.path.join(download_root, datetime.now().strftime("run_%Y%m%d_%H%M%S"))
     os.makedirs(download_dir, exist_ok=True)
     os.makedirs(SESSION_DIR, exist_ok=True)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  PHOTO DOWNLOAD: {month_name} {year}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"  Download folder: {download_dir}")
 
     with sync_playwright() as p:
-        # Use real Chrome with persistent profile (keeps login state)
         context = p.chromium.launch_persistent_context(
             user_data_dir=SESSION_DIR,
             channel="chrome",
-            headless=False,
+            headless=bool(_cfg("BROWSER_HEADLESS", False)),
             accept_downloads=True,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=_browser_args(),
         )
 
-        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
 
-        # Navigate to Google Photos
-        print("\n  Opening Google Photos...")
-        page.goto("https://photos.google.com/", wait_until="domcontentloaded", timeout=30000)
-        time.sleep(2)
+            print("\n  Opening Google Photos...")
+            page.goto(
+                "https://photos.google.com/",
+                wait_until="domcontentloaded",
+                timeout=int(_cfg("GOOGLE_PHOTOS_TIMEOUT_MS", 60000)),
+            )
+            _wait(page, 2.0)
 
-        if "accounts.google.com" in page.url or "signin" in page.url.lower():
-            print("\n  ⚠️  YOU ARE NOT LOGGED IN!")
-            if sys.stdin.isatty():
-                print("  -> Please login in the opened Chrome window.")
-                print("  -> When you reach the Google Photos home, press ENTER here.")
-                input("  Press ENTER to continue...")
-                page.goto("https://photos.google.com/", wait_until="domcontentloaded", timeout=30000)
-                time.sleep(2)
-            else:
-                print("  -> ERROR: Session expired and running in automatic mode. Failing preemptively.")
-                context.close()
-                raise RuntimeError("Not logged into Google Photos. Run 'python3 setup_auth.py' manually.")
+            if "accounts.google.com" in page.url or "signin" in page.url.lower():
+                print("\n  WARNING: You are not logged in.")
+                if sys.stdin.isatty():
+                    print("  Please log in in the opened Chrome window.")
+                    print("  When Google Photos is loaded, press ENTER here.")
+                    input("  Press ENTER to continue...")
+                    page.goto(
+                        "https://photos.google.com/",
+                        wait_until="domcontentloaded",
+                        timeout=int(_cfg("GOOGLE_PHOTOS_TIMEOUT_MS", 60000)),
+                    )
+                    _wait(page, 2.0)
+                else:
+                    raise RuntimeError("Not logged into Google Photos. Run 'python3 setup_auth.py' manually.")
 
-        # Navigate to date search
-        search_query = f"{month_name} {year}"
-        import urllib.parse
-        search_url = f"https://photos.google.com/search/{urllib.parse.quote(search_query)}"
-        print(f"\n  Searching photos for: {search_query}...")
-        page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(3)
+            all_urls: list[str] = []
+            seen_photo_keys: set[str] = set()
 
-        # Scroll the page to load all photos
-        print("  Scrolling page to load all photos...")
-        prev_count = 0
-        scroll_attempts = 0
-        max_scroll_attempts = 50
+            for search_query in _search_queries(year, month):
+                search_url = f"https://photos.google.com/search/{urllib.parse.quote(search_query, safe='')}"
+                print(f"\n  Searching Google Photos for: {search_query}...")
+                page.goto(
+                    search_url,
+                    wait_until="domcontentloaded",
+                    timeout=int(_cfg("GOOGLE_PHOTOS_TIMEOUT_MS", 60000)),
+                )
+                _wait(page, float(_cfg("SEARCH_SETTLE_SECONDS", 3.0)))
 
-        while scroll_attempts < max_scroll_attempts:
-            photo_links = page.query_selector_all('a[data-photo-id], div[data-media-key], a[href*="/photo/"]')
-            current_count = len(photo_links)
+                print("  Scrolling until the media grid stops loading new items...")
+                found_urls = _collect_urls_while_scrolling(page)
+                new_urls = []
+                for url in found_urls:
+                    photo_key = _photo_key(url)
+                    if photo_key in seen_photo_keys:
+                        continue
+                    seen_photo_keys.add(photo_key)
+                    new_urls.append(url)
+                    all_urls.append(url)
+                print(f"  Query result: {len(found_urls)} links, {len(new_urls)} new.")
 
-            if current_count == prev_count:
-                scroll_attempts += 1
-                if scroll_attempts >= 3:
-                    break
-            else:
-                scroll_attempts = 0
+            if not all_urls:
+                print(f"\n  No media links found for {month_name} {year}.")
+                debug_path = os.path.join(BASE_DIR, "debug_screenshot.png")
+                page.screenshot(path=debug_path)
+                print(f"  Screenshot saved to: {debug_path}")
+                return []
 
-            prev_count = current_count
-            page.keyboard.press("End")
-            time.sleep(1.5)
+            print(f"\n  Found {len(all_urls)} unique media links. Starting download...")
+            downloaded_files: list[dict] = []
+            used_upload_names: set[str] = set()
+            downloaded_hashes: set[str] = set()
+            retries = max(1, int(_cfg("DOWNLOAD_RETRIES", 3)))
 
-        # Collect photo links
-        photo_elements = page.query_selector_all('a[href*="/photo/"]')
-        if not photo_elements:
-            photo_elements = page.query_selector_all('[data-latest-bg]')
+            for index, photo_url in enumerate(all_urls, 1):
+                last_error = None
+                for attempt in range(1, retries + 1):
+                    try:
+                        item = _download_one(page, photo_url, index, len(all_urls), download_dir, used_upload_names)
+                        file_hash = _file_sha256(item["local_path"])
+                        if file_hash in downloaded_hashes:
+                            print(f"SKIP DUPLICATE CONTENT: {item['original_filename']}")
+                            try:
+                                os.remove(item["local_path"])
+                            except OSError:
+                                pass
+                            last_error = None
+                            break
 
-        photo_urls = []
-        for el in photo_elements:
-            href = el.get_attribute("href")
-            if not href:
-                try:
-                    parent = el.query_selector("xpath=ancestor::a[contains(@href, '/photo/')]")
-                    if parent:
-                        href = parent.get_attribute("href")
-                except Exception:
-                    pass
-            if href and "/photo/" in href:
-                full_url = href if href.startswith("http") else f"https://photos.google.com{href}"
-                if full_url not in photo_urls:
-                    photo_urls.append(full_url)
-
-        if not photo_urls:
-            print(f"\n  No photos found for {month_name} {year}.")
-            print("  Check that there are photos in Google Photos for this period.")
-            debug_path = os.path.join(BASE_DIR, "debug_screenshot.png")
-            page.screenshot(path=debug_path)
-            print(f"  Screenshot saved to: {debug_path}")
-            context.close()
-            return []
-
-        print(f"\n  Found {len(photo_urls)} photos. Starting download...")
-        downloaded_files = []
-
-        for i, photo_url in enumerate(photo_urls, 1):
-            try:
-                print(f"  [{i}/{len(photo_urls)}] Downloading...", end=" ", flush=True)
-                page.goto(photo_url, wait_until="domcontentloaded", timeout=20000)
-                time.sleep(1)
-
-                # Use Shift+D to download (Google Photos shortcut)
-                with page.expect_download(timeout=30000) as download_info:
-                    page.keyboard.down("Shift")
-                    page.keyboard.press("d")
-                    page.keyboard.up("Shift")
-
-                download = download_info.value
-                filename = download.suggested_filename
-                save_path = os.path.join(download_dir, filename)
-
-                # Avoid duplicates
-                if os.path.exists(save_path):
-                    print(f"SKIP (already present): {filename}")
-                    download.delete()
-                    item = {"local_path": save_path, "google_url": photo_url}
-                    if not any(d["local_path"] == save_path for d in downloaded_files):
+                        item["sha256"] = file_hash
+                        downloaded_hashes.add(file_hash)
                         downloaded_files.append(item)
                         if on_downloaded:
                             on_downloaded(item)
-                    continue
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt < retries:
+                            print(f"RETRY {attempt}/{retries}: {exc}")
+                            _wait(page, min(2.0 * attempt, 10.0))
+                        else:
+                            print(f"ERROR: {exc}")
 
-                download.save_as(save_path)
-                item = {"local_path": save_path, "google_url": photo_url}
-                downloaded_files.append(item)
-                print(f"OK: {filename}")
+                if last_error is not None:
+                    _LAST_DOWNLOAD_ERRORS.append(f"{photo_url}: {last_error}")
 
-                # Notify pipeline: this photo is ready for upload
-                if on_downloaded:
-                    on_downloaded(item)
+        finally:
+            context.close()
 
-            except Exception as e:
-                print(f"ERROR: {e}")
-
-        context.close()
-
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  DOWNLOAD COMPLETED: {month_name} {year}")
     print(f"  Downloaded files: {len(downloaded_files)}")
+    print(f"  Download errors: {len(_LAST_DOWNLOAD_ERRORS)}")
     print(f"  Folder: {download_dir}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     return downloaded_files
 
 
 def delete_photos_from_google(items: list[dict]) -> None:
     """
-    Deletes photos from Google Photos using multiple browser tabs concurrently.
-    Uses the '#' keyboard shortcut to move items to the trash.
-    Processes CONCURRENT_DELETES photos at a time using separate tabs.
+    Move Google Photos items to trash using the browser shortcut.
+
+    Processes CONCURRENT_DELETES items at a time using separate tabs.
     """
     if not items:
         return
 
     from playwright.sync_api import sync_playwright
 
-    concurrent = getattr(config, "CONCURRENT_DELETES", 3)
+    concurrent = max(1, int(getattr(config, "CONCURRENT_DELETES", 3)))
 
-    print(f"\n{'='*60}")
-    print(f"  DELETING FROM GOOGLE PHOTOS (to trash): {len(items)} photos")
+    print(f"\n{'=' * 60}")
+    print(f"  DELETING FROM GOOGLE PHOTOS (to trash): {len(items)} items")
     print(f"  Concurrent tabs: {concurrent}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=SESSION_DIR,
             channel="chrome",
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
+            headless=bool(_cfg("BROWSER_HEADLESS", False)),
+            args=_browser_args(),
         )
 
-        deleted_count = 0
-        error_count = 0
+        try:
+            deleted_count = 0
+            error_count = 0
 
-        # Process in batches of `concurrent` items
-        for batch_start in range(0, len(items), concurrent):
-            batch = items[batch_start : batch_start + concurrent]
-            batch_num = batch_start // concurrent + 1
-            total_batches = (len(items) + concurrent - 1) // concurrent
-            print(f"\n  --- Batch {batch_num}/{total_batches} ({len(batch)} photos) ---")
+            for batch_start in range(0, len(items), concurrent):
+                batch = items[batch_start : batch_start + concurrent]
+                batch_num = batch_start // concurrent + 1
+                total_batches = (len(items) + concurrent - 1) // concurrent
+                print(f"\n  --- Batch {batch_num}/{total_batches} ({len(batch)} items) ---")
 
-            # Open a tab for each item in the batch and navigate
-            tabs = []
-            for item in batch:
-                url = item.get("google_url")
-                if not url:
-                    continue
-                tab = context.new_page()
-                tabs.append((tab, item, url))
+                tabs = []
+                for item in batch:
+                    url = item.get("google_url")
+                    if not url:
+                        continue
+                    tab = context.new_page()
+                    tabs.append((tab, item, url))
 
-            # Navigate all tabs to their photo URLs concurrently
-            for tab, item, url in tabs:
-                try:
-                    tab.goto(url, wait_until="domcontentloaded", timeout=20000)
-                except Exception as e:
-                    print(f"  Navigation error: {e}")
+                for tab, item, url in tabs:
+                    try:
+                        tab.goto(
+                            url,
+                            wait_until="domcontentloaded",
+                            timeout=int(_cfg("PHOTO_NAVIGATION_TIMEOUT_MS", 60000)),
+                        )
+                        _mute_media_on_page(tab)
+                    except Exception as exc:
+                        print(f"  Navigation error: {exc}")
 
-            # Wait for all pages to load
-            time.sleep(2)
+                if tabs:
+                    _wait(tabs[0][0], 2.0)
 
-            # Now press # + Enter on each tab to delete
-            for idx, (tab, item, url) in enumerate(tabs):
-                i = batch_start + idx + 1
-                try:
-                    print(f"  [{i}/{len(items)}] Deleting...", end=" ", flush=True)
-                    tab.keyboard.press("#")
-                    time.sleep(0.5)
-                    tab.keyboard.press("Enter")
-                    
-                    # Verify deletion: wait for URL to change (Google Photos navigates to next photo on delete)
-                    deletion_verified = False
-                    for _ in range(3): # Wait up to 3 seconds
-                        time.sleep(1)
-                        if tab.url != url:
-                            deletion_verified = True
-                            break
-                    
-                    if deletion_verified:
-                        print("DONE")
-                        deleted_count += 1
-                    else:
-                        print("FAILED (URL did not change, probably not deleted)")
+                for idx, (tab, item, url) in enumerate(tabs):
+                    item_num = batch_start + idx + 1
+                    try:
+                        print(f"  [{item_num}/{len(items)}] Deleting...", end=" ", flush=True)
+                        tab.keyboard.press("#")
+                        _wait(tab, 0.5)
+                        tab.keyboard.press("Enter")
+
+                        deletion_verified = False
+                        for _ in range(5):
+                            _wait(tab, 1.0)
+                            if tab.url != url:
+                                deletion_verified = True
+                                break
+
+                        if deletion_verified:
+                            print("DONE")
+                            deleted_count += 1
+                        else:
+                            print("FAILED (URL did not change)")
+                            error_count += 1
+                    except Exception as exc:
+                        print(f"ERROR: {exc}")
                         error_count += 1
-                except Exception as e:
-                    print(f"ERROR: {e}")
-                    error_count += 1
 
-            # Close batch tabs
-            for tab, _, _ in tabs:
-                try:
-                    tab.close()
-                except Exception:
-                    pass
+                for tab, _, _ in tabs:
+                    try:
+                        tab.close()
+                    except Exception:
+                        pass
 
-            # Brief pause between batches
-            time.sleep(0.5)
+                time.sleep(0.5)
 
-        context.close()
+        finally:
+            context.close()
 
     print(f"\n  Successfully deleted: {deleted_count}/{len(items)}")
     if error_count > 0:
         print(f"  Errors: {error_count}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
 
 if __name__ == "__main__":
@@ -300,7 +525,6 @@ if __name__ == "__main__":
         year = int(sys.argv[1])
         month = int(sys.argv[2])
     else:
-        # Default: previous month, aligned with backup.py
         now = datetime.now()
         month = now.month - 1 if now.month > 1 else 12
         year = now.year if now.month > 1 else now.year - 1
@@ -311,4 +535,4 @@ if __name__ == "__main__":
 
     files = download_photos_for_month(year, month)
     if files:
-        print(f"Downloaded {len(files)} photos to .tmp_download/{year}_{month:02d}/")
+        print(f"Downloaded {len(files)} files to .tmp_download/{year}_{month:02d}/")

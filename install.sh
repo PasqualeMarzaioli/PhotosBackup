@@ -1,6 +1,7 @@
 #!/bin/bash
 # --- install.sh ---------------------------------------------------------------
 # Installs Python dependencies and activates the macOS LaunchAgent.
+# Author: Pasquale Marzaioli
 # Run with:  bash install.sh
 # ------------------------------------------------------------------------------
 
@@ -38,11 +39,11 @@ mkdir -p "$SCRIPT_DIR/.tmp_download"
 echo ""
 echo "-> Configuring and Installing macOS LaunchAgent..."
 
-# Find the Python path used (preferring Python 3.11 if available)
+# Find the Python path used by helper scripts when PYTHON_BIN is not set.
 PYTHON_PATH=$(which python3.11 || which python3 || echo "/usr/bin/python3")
 echo "  Using Python path for LaunchAgent: $PYTHON_PATH"
 
-# Generate the real plist from the example by replacing path and python placeholders
+# Generate the real plist from the example by replacing path and python placeholders.
 sed -e "s|__PROJECT_PATH__|$SCRIPT_DIR|g" -e "s|__PYTHON_PATH__|$PYTHON_PATH|g" "$SCRIPT_DIR/com.pasquale.photosbackup.plist.example" > "$SCRIPT_DIR/$PLIST_NAME"
 
 mkdir -p "$LAUNCH_AGENTS_DIR"
@@ -53,7 +54,7 @@ launchctl unload "$LAUNCH_AGENTS_DIR/$PLIST_NAME" 2>/dev/null || true
 launchctl load "$LAUNCH_AGENTS_DIR/$PLIST_NAME"
 
 echo "  LaunchAgent installed and loaded: $PLIST_NAME"
-echo "  The script will start automatically every 2nd of the month at 09:00."
+echo "  The checker will run daily at 09:00 and start the monthly backup only when needed."
 
 echo ""
 echo "=============================================="

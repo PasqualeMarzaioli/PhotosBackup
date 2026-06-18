@@ -1,6 +1,10 @@
 """
+Runs the monthly Google Photos to OneDrive backup workflow.
+
+Author: Pasquale Marzaioli
+
 Main backup script: Google Photos -> OneDrive.
-Executed automatically every 2nd of the month via macOS LaunchAgent.
+Executed manually or by the daily macOS LaunchAgent checker.
 
 Uses a pipeline architecture for maximum speed:
   1. Photos are downloaded one by one from Google Photos (Playwright)
@@ -19,7 +23,7 @@ import os
 import shutil
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from datetime import datetime
 
 import requests
@@ -42,10 +46,16 @@ logger = logging.getLogger(__name__)
 
 
 def send_telegram(message: str) -> None:
+    token = getattr(config, "TELEGRAM_BOT_TOKEN", "")
+    chat_id = getattr(config, "TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id or token.startswith("YOUR_") or chat_id.startswith("YOUR_"):
+        logger.debug("Telegram credentials are not configured; notification skipped.")
+        return
+
     try:
         requests.post(
-            f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={"chat_id": config.TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"},
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
             timeout=10,
         )
     except Exception as e:
@@ -68,9 +78,12 @@ def _upload_one(item: dict, onedrive_path: str) -> tuple[dict, bool]:
     Thread-safe: each call gets its own token from MSAL cache.
     """
     local_path = item["local_path"]
-    filename = os.path.basename(local_path)
+    filename = item.get("upload_filename") or os.path.basename(local_path)
     try:
-        ok = onedrive.upload_file(local_path, onedrive_path)
+        if item.get("upload_filename"):
+            ok = onedrive.upload_file(local_path, onedrive_path, target_filename=filename)
+        else:
+            ok = onedrive.upload_file(local_path, onedrive_path)
         if ok:
             # Remove temp file after successful upload
             try:
@@ -103,7 +116,7 @@ def run_backup(year: int, month: int) -> None:
 
     # ── Pipeline: concurrent uploads start as photos are downloaded ──────────
     executor = ThreadPoolExecutor(
-        max_workers=config.CONCURRENT_UPLOADS,
+        max_workers=max(1, int(config.CONCURRENT_UPLOADS)),
         thread_name_prefix="upload",
     )
     futures: list[tuple[Future, dict]] = []
@@ -128,7 +141,13 @@ def run_backup(year: int, month: int) -> None:
         raise
 
     if not all_items:
-        logger.info("No photos found or downloaded for this month.")
+        download_errors = download_photos.get_last_download_errors()
+        if download_errors:
+            logger.error(f"No files downloaded, but {len(download_errors)} download errors occurred.")
+            for error in download_errors[:5]:
+                logger.error(f"  Download error: {error}")
+        else:
+            logger.info("No photos found or downloaded for this month.")
         executor.shutdown()
         return
 
@@ -142,9 +161,11 @@ def run_backup(year: int, month: int) -> None:
     with futures_lock:
         pending = list(futures)
 
-    for future, item in pending:
+    item_by_future = {future: item for future, item in pending}
+    for future in as_completed(item_by_future):
+        item = item_by_future[future]
         try:
-            returned_item, ok = future.result(timeout=300)  # 5 min max per file
+            returned_item, ok = future.result()
             if ok:
                 success_count += 1
                 successful_items.append(returned_item)
@@ -157,39 +178,69 @@ def run_backup(year: int, month: int) -> None:
 
     executor.shutdown()
 
+    download_errors = download_photos.get_last_download_errors()
+    download_error_count = len(download_errors)
+    if download_error_count:
+        logger.error(f"Download errors: {download_error_count}")
+        for error in download_errors[:10]:
+            logger.error(f"  Download error: {error}")
+        if download_error_count > 10:
+            logger.error(f"  ... plus {download_error_count - 10} more download errors")
+
+    total_error_count = error_count + download_error_count
+
     # 3. Delete from Google Photos (concurrent tabs)
-    if successful_items:
+    should_delete = bool(getattr(config, "DELETE_AFTER_UPLOAD", True))
+    partial_delete_allowed = bool(getattr(config, "DELETE_ON_PARTIAL_SUCCESS", False))
+    if successful_items and should_delete and (total_error_count == 0 or partial_delete_allowed):
         logger.info(f"Deleting {len(successful_items)} items from Google Photos...")
         try:
             download_photos.delete_photos_from_google(successful_items)
         except Exception as e:
             logger.error(f"Error deleting from Google Photos: {e}")
+    elif successful_items and should_delete:
+        logger.warning(
+            "Google Photos deletion skipped because the run had errors. "
+            "Uploaded files remain backed up on OneDrive."
+        )
+    elif successful_items:
+        logger.info("Google Photos deletion is disabled by configuration.")
 
     # Clean up temporary directory
-    if os.path.exists(temp_dir):
+    if total_error_count == 0 and os.path.exists(temp_dir):
         try:
             shutil.rmtree(temp_dir)
         except Exception:
             pass
+    elif os.path.exists(temp_dir):
+        logger.warning(f"Temporary files kept for inspection: {temp_dir}")
 
     logger.info("=" * 60)
     logger.info(f"BACKUP COMPLETED: {month_name} {year}")
     logger.info(f"  Successfully uploaded : {success_count}")
-    logger.info(f"  Errors                : {error_count}")
+    logger.info(f"  Upload errors         : {error_count}")
+    logger.info(f"  Download errors       : {download_error_count}")
+    logger.info(f"  Errors                : {total_error_count}")
     logger.info("=" * 60)
 
-    if error_count == 0:
+    if total_error_count == 0:
+        deletion_text = (
+            "Google Photos items were moved to trash automatically."
+            if should_delete
+            else "Google Photos deletion is disabled."
+        )
         send_telegram(
-            f"✅ *Backup completed!*\n\n"
-            f"📁 {success_count} photos of *{month_name} {year}* are safely stored on OneDrive.\n\n"
-            f"🗑 Photos deleted from Google Photos automatically."
+            f"*Backup completed*\n\n"
+            f"{success_count} files from *{month_name} {year}* are stored on OneDrive.\n\n"
+            f"{deletion_text}"
         )
     else:
         send_telegram(
-            f"⚠️ *Backup for {month_name} {year} completed with errors*\n\n"
-            f"✅ Uploaded: {success_count}\n"
-            f"❌ Errors: {error_count}\n\n"
-            f"Check the logs before deleting photos from Google Photos."
+            f"*Backup for {month_name} {year} completed with errors*\n\n"
+            f"Uploaded: {success_count}\n"
+            f"Upload errors: {error_count}\n"
+            f"Download errors: {download_error_count}\n\n"
+            f"Google Photos deletion was skipped unless DELETE_ON_PARTIAL_SUCCESS is enabled."
         )
 
 

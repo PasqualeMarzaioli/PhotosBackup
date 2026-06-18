@@ -1,14 +1,16 @@
 """
+Provides optional Google Photos Library API helpers.
+
+Author: Pasquale Marzaioli
+
 Module for accessing the Google Photos Library API.
-Handles OAuth2 authentication and retrieval of images per month.
+Handles OAuth2 authentication and retrieval of media items per month.
 """
 
-import json
 import os
 import logging
 import requests
 import calendar
-from datetime import datetime
 from typing import Optional
 
 from google.oauth2.credentials import Credentials
@@ -47,7 +49,7 @@ def _get_credentials() -> Credentials:
 
 def get_photos_for_month(year: int, month: int) -> list[dict]:
     """
-    Retrieves all photos for a specific month from Google Photos.
+    Retrieves all media items for a specific month from Google Photos.
     Returns a list of dicts returning 'id', 'filename', 'baseUrl', 'mimeType'.
     """
     creds = _get_credentials()
@@ -66,11 +68,11 @@ def get_photos_for_month(year: int, month: int) -> list[dict]:
                     }
                 ]
             },
-            "mediaTypeFilter": {"mediaTypes": ["PHOTO"]},
+            "mediaTypeFilter": {"mediaTypes": ["PHOTO", "VIDEO"]},
         },
     }
 
-    photos = []
+    media_items = []
     page_token = None
 
     while True:
@@ -82,7 +84,7 @@ def get_photos_for_month(year: int, month: int) -> list[dict]:
         data = response.json()
 
         items = data.get("mediaItems", [])
-        photos.extend(
+        media_items.extend(
             {
                 "id": item["id"],
                 "filename": item["filename"],
@@ -92,18 +94,18 @@ def get_photos_for_month(year: int, month: int) -> list[dict]:
             for item in items
         )
 
-        logger.info(f"Retrieved {len(photos)} photos so far...")
+        logger.info(f"Retrieved {len(media_items)} media items so far...")
         page_token = data.get("nextPageToken")
         if not page_token:
             break
 
-    logger.info(f"Total photos found for {month}/{year}: {len(photos)}")
-    return photos
+    logger.info(f"Total media items found for {month}/{year}: {len(media_items)}")
+    return media_items
 
 
 def download_photo(photo: dict, dest_dir: str) -> Optional[str]:
     """
-    Downloads a single photo into the dest_dir.
+    Downloads a single media item into the dest_dir.
     Returns the local path of the downloaded file, or None in case of an error.
     """
     os.makedirs(dest_dir, exist_ok=True)
@@ -113,8 +115,9 @@ def download_photo(photo: dict, dest_dir: str) -> Optional[str]:
         logger.debug(f"Already present: {photo['filename']}, skip.")
         return dest_path
 
-    # =d for high resolution download
-    download_url = photo["baseUrl"] + "=d"
+    # Google Photos Library API uses a different download suffix for videos.
+    suffix = "=dv" if photo.get("mimeType", "").startswith("video/") else "=d"
+    download_url = photo["baseUrl"] + suffix
 
     try:
         response = requests.get(download_url, timeout=60, stream=True)
@@ -122,7 +125,8 @@ def download_photo(photo: dict, dest_dir: str) -> Optional[str]:
 
         with open(dest_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=1024 * 1024):
-                f.write(chunk)
+                if chunk:
+                    f.write(chunk)
 
         logger.debug(f"Downloaded: {photo['filename']}")
         return dest_path

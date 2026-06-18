@@ -1,13 +1,26 @@
 #!/bin/bash
-# Path generalization
+# Send a Telegram reminder before the monthly backup window.
+# Author: Pasquale Marzaioli
+
+set -euo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Get configuration and secrets from config.py
-BOT_TOKEN=$(python3 -c "import config; print(config.TELEGRAM_BOT_TOKEN)")
-CHAT_ID=$(python3 -c "import config; print(config.TELEGRAM_CHAT_ID)")
-MONTH_NAME=$(python3 -c "from datetime import datetime; import config; d=datetime.now(); m=d.month-1 if d.month>1 else 12; print(config.MONTHS[m])")
-YEAR=$(python3 -c "from datetime import datetime; d=datetime.now(); y=d.year if d.month>1 else d.year-1; print(y)")
+if [ -z "${PYTHON_BIN:-}" ]; then
+    if [ -x "$SCRIPT_DIR/venv/bin/python" ]; then
+        PYTHON_BIN="$SCRIPT_DIR/venv/bin/python"
+    elif command -v python3.11 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3.11)"
+    else
+        PYTHON_BIN="$(command -v python3)"
+    fi
+fi
+
+BOT_TOKEN=$("$PYTHON_BIN" -c "import config; print(config.TELEGRAM_BOT_TOKEN)")
+CHAT_ID=$("$PYTHON_BIN" -c "import config; print(config.TELEGRAM_CHAT_ID)")
+MONTH_NAME=$("$PYTHON_BIN" -c "from datetime import datetime; import config; d=datetime.now(); m=d.month-1 if d.month>1 else 12; print(config.MONTHS[m])")
+YEAR=$("$PYTHON_BIN" -c "from datetime import datetime; d=datetime.now(); print(d.year if d.month>1 else d.year-1)")
 
 PREVIOUS_MONTH="$MONTH_NAME $YEAR"
 

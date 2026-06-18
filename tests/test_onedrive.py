@@ -1,3 +1,9 @@
+"""
+Tests the Microsoft OneDrive upload helpers.
+
+Author: Pasquale Marzaioli
+"""
+
 import unittest
 from unittest.mock import patch, mock_open, MagicMock
 import os

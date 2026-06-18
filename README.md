@@ -1,12 +1,18 @@
 # Google Photos to OneDrive Backup
 
-Automated monthly backup of your photos: every **2nd of the month** the script downloads the previous month's photos from Google Photos, deletes them from Google Photos, and uploads them to OneDrive in the following folder:
+Author: Pasquale Marzaioli
+
+Automated monthly backup of your Google Photos media to OneDrive.
+
+The LaunchAgent runs a lightweight checker every day at **09:00**. Starting from the configured backup day, the checker runs the previous month's backup only if a successful run is not already present in `backup.log`. This means the backup can catch up if the Mac was asleep or turned off on the scheduled day.
+
+Uploaded files are stored in this OneDrive folder:
 
 ```
-Memorie/immagine/{year}/{mm.MonthName year}
+Immagini/Memorie/{year}/{mm.MonthName year}
 ```
 
-**Example:** `Memorie/immagine/2026/04.Aprile 2026`
+**Example:** `Immagini/Memorie/2026/04.Aprile 2026`
 
 ---
 
@@ -15,23 +21,24 @@ Memorie/immagine/{year}/{mm.MonthName year}
 - macOS with Python 3.9+
 - Google account with Google Photos
 - Microsoft account with personal OneDrive
+- A Microsoft app registration for OneDrive access
+- Google Chrome for the browser-based Google Photos session
 
 ---
 
-## Step 1 — Create Google Photos API Credentials
+## Step 1 — Prepare Google Photos Access
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project (e.g., "PhotosBackup")
-3. Sidebar menu → **APIs & Services** → **Library**
-4. Search for **"Photos Library API"** and enable it
-5. Go to **Credentials** → **Create Credentials** → **OAuth client ID**
-6. Application type: **Desktop app**
-7. Download the JSON → copy the values into `config.py`:
-   ```python
-   GOOGLE_CLIENT_ID = "xxxxx.apps.googleusercontent.com"
-   GOOGLE_CLIENT_SECRET = "GOCSPX-xxxxx"
-   ```
-8. In **OAuth consent screen** → add your email as a test user
+The active downloader uses a real Chrome session because Google Photos browser downloads are more complete for personal-library backups than the Google Photos Library API.
+
+Run:
+
+```bash
+python3 setup_auth.py
+```
+
+Chrome opens and asks you to sign in to Google Photos. Once the library is visible, return to the terminal and continue. The browser profile is saved in `.chrome_session/` and reused by future backups.
+
+The optional `google_photos.py` helper can still use the Google Photos Library API for experiments, but it is not the primary backup path.
 
 ---
 
@@ -70,9 +77,19 @@ MONTHS = {
 ```
 
 ### Concurrency Settings
-You can speed up the process by increasing the number of parallel uploads or browser tabs in `config.py`:
+You can speed up the process by changing the parallelism settings in `config.py`:
 - `CONCURRENT_UPLOADS`: Simultaneous uploads to OneDrive.
 - `CONCURRENT_DELETES`: Number of browser tabs used for deletion.
+
+### Reliability and Safety Settings
+The browser downloader and OneDrive uploader are intentionally conservative:
+
+- `MAX_SCROLL_ATTEMPTS`, `SCROLL_IDLE_ROUNDS`: Control how long Google Photos is scrolled before the media grid is considered fully loaded.
+- `DOWNLOAD_RETRIES`: Retries per Google Photos media item.
+- `REQUEST_RETRIES`: Retries for transient OneDrive and network errors.
+- `MUTE_BROWSER_AUDIO`: Opens Google Photos media pages without video/audio playback sound.
+- `DELETE_AFTER_UPLOAD`: Enables automatic deletion from Google Photos after a successful backup.
+- `DELETE_ON_PARTIAL_SUCCESS`: Defaults to `False`; when a run has download or upload errors, Google Photos deletion is skipped.
 
 ---
 
@@ -94,8 +111,9 @@ python3 setup_auth.py
 
 | Command | Description |
 |---------|-------------|
-| `python3 backup.py` | Backup for the previous month |
-| `python3 backup.py 2026 3` | Backup for March 2026 |
+| `./backup.sh` | Backup for the previous month |
+| `./backup.sh 2026 3` | Backup for March 2026 |
+| `./check_and_backup.sh` | Run the catch-up checker |
 | `python3 setup_auth.py` | Re-authentication (expired token) |
 
 ### LaunchAgent Management
@@ -122,10 +140,12 @@ launchctl load ~/Library/LaunchAgents/com.pasquale.photosbackup.plist
 PhotosBackup/
 ├── backup.py          # Main script
 ├── config.py          # Configuration and credentials
-├── google_photos.py  # Google Photos API module
+├── download_photos.py # Active browser-based Google Photos downloader
+├── google_photos.py  # Optional Google Photos Library API helper
 ├── onedrive.py        # Microsoft Graph API module
 ├── setup_auth.py      # Authentication setup
 ├── install.sh         # Installation script
+├── check_and_backup.sh # Daily catch-up checker
 ├── requirements.txt   # Python dependencies
 ├── backup.log         # Operations log
 ├── README.md          # Project instructions
@@ -143,10 +163,11 @@ All backups are recorded in `backup.log`:
 
 ```
 2026-04-02 09:00:01  INFO     BACKUP STARTED: April 2026
-2026-04-02 09:00:03  INFO     Found 47 photos.
+2026-04-02 09:00:03  INFO     Found 47 unique media links.
 2026-04-02 09:01:22  INFO     BACKUP COMPLETED: April 2026
 2026-04-02 09:01:22  INFO       Successfully uploaded : 47
-2026-04-02 09:01:22  INFO       Already present (skip): 0
+2026-04-02 09:01:22  INFO       Upload errors         : 0
+2026-04-02 09:01:22  INFO       Download errors       : 0
 2026-04-02 09:01:22  INFO       Errors                : 0
 ```
 
@@ -154,7 +175,12 @@ All backups are recorded in `backup.log`:
 
 ## Important Notes
 
-- Tokens are automatically renewed without requiring a new login
-- Photos already present on OneDrive are skipped (no duplicates)
-- If the Mac is turned off on the 2nd of the month, the backup is not executed and will resume the following month
-- Temporary files are automatically deleted after upload
+- Microsoft tokens are automatically renewed without requiring a new login.
+- Files already present on OneDrive with the same name and size are skipped.
+- Same-name files with different sizes are uploaded with a numbered suffix instead of being silently skipped.
+- Google Photos URLs are canonicalized so the same media item is not downloaded repeatedly from different browser routes.
+- Duplicate downloaded content is detected by SHA-256 and skipped before upload.
+- Google Photos video/audio pages are opened muted when `MUTE_BROWSER_AUDIO = True`.
+- If the Mac is turned off on the scheduled day, the daily checker catches up when the Mac is available again.
+- Google Photos deletion is skipped when any download or upload error occurs, unless `DELETE_ON_PARTIAL_SUCCESS` is explicitly enabled.
+- Temporary files are automatically deleted only after a fully successful run; failed runs keep them for inspection.

@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent template for the PhotosBackup daily checker. -->
+<!-- Author: Pasquale Marzaioli -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -8,15 +10,13 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__PYTHON_PATH__</string>
-        <string>__PROJECT_PATH__/backup.py</string>
+        <string>/bin/bash</string>
+        <string>__PROJECT_PATH__/check_and_backup.sh</string>
     </array>
 
-    <!-- Run every 2nd of the month at 09:00 -->
+    <!-- Check daily at 09:00; check_and_backup.sh only runs the monthly backup when needed. -->
     <key>StartCalendarInterval</key>
     <dict>
-        <key>Day</key>
-        <integer>2</integer>
         <key>Hour</key>
         <integer>9</integer>
         <key>Minute</key>
@@ -33,6 +33,6 @@
     <string>__PROJECT_PATH__/backup_error.log</string>
 
     <key>RunAtLoad</key>
-    <false/>
+    <true/>
 </dict>
 </plist>

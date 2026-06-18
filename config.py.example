@@ -1,5 +1,8 @@
 """
-Template configuration for the Photos -> OneDrive backup.
+Template settings for the Google Photos to OneDrive backup.
+
+Author: Pasquale Marzaioli
+
 Rename this file to `config.py` and fill in your credentials.
 """
 
@@ -11,7 +14,9 @@ TOKENS_DIR = os.path.join(BASE_DIR, ".tokens")
 LOG_FILE = os.path.join(BASE_DIR, "backup.log")
 TEMP_DIR = os.path.join(BASE_DIR, ".tmp_download")
 
-# --- Google Photos ---
+# --- Optional Google Photos Library API ---
+# The active backup uses the Chrome session saved by setup_auth.py.
+# These credentials are only needed if you use google_photos.py directly.
 # Get credentials from: https://console.cloud.google.com/
 GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID"
 GOOGLE_CLIENT_SECRET = "YOUR_GOOGLE_CLIENT_SECRET"
@@ -29,6 +34,11 @@ MICROSOFT_SCOPES = ["Files.ReadWrite"]
 # Example: Immagini/Memorie/2026/04.Aprile 2026
 ONEDRIVE_ROOT_FOLDER = "Immagini/Memorie"
 
+# --- Backup Schedule ---
+# The LaunchAgent may run the checker every day; the checker only starts the
+# monthly backup on or after this day.
+BACKUP_NOT_BEFORE_DAY = 2
+
 # --- Telegram ---
 # Create a bot via @BotFather to get your token and chat ID.
 TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
@@ -37,6 +47,26 @@ TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 # --- Concurrency ---
 CONCURRENT_UPLOADS = 4
 CONCURRENT_DELETES = 3
+
+# --- Browser Download Reliability ---
+BROWSER_HEADLESS = False
+MUTE_BROWSER_AUDIO = True
+MAX_SCROLL_ATTEMPTS = 120
+SCROLL_IDLE_ROUNDS = 8
+SCROLL_PAUSE_SECONDS = 1.0
+SEARCH_SETTLE_SECONDS = 3.0
+PHOTO_NAVIGATION_TIMEOUT_MS = 60000
+GOOGLE_PHOTOS_TIMEOUT_MS = 60000
+DOWNLOAD_TIMEOUT_MS = 120000
+DOWNLOAD_RETRIES = 3
+
+# --- Backup Safety ---
+DELETE_AFTER_UPLOAD = True
+DELETE_ON_PARTIAL_SUCCESS = False
+
+# --- Network Retry Settings ---
+REQUEST_RETRIES = 5
+REQUEST_RETRY_BACKOFF_SECONDS = 2.0
 
 # --- Month Names ---
 MONTHS = {

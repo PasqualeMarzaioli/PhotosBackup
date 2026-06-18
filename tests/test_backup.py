@@ -1,3 +1,9 @@
+"""
+Tests the main backup orchestration helpers.
+
+Author: Pasquale Marzaioli
+"""
+
 import unittest
 from unittest.mock import patch, MagicMock
 import os

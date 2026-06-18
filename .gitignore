@@ -1,7 +1,11 @@
+# Ignore local runtime files for the PhotosBackup project.
+# Author: Pasquale Marzaioli
+
 # General
 .DS_Store
 __pycache__/
 *.pyc
+venv/
 
 # Project Specific
 .tokens/
