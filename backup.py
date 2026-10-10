@@ -18,12 +18,13 @@ Manual usage:
     python backup.py 2026 3        # backup for March 2026
 """
 
+import argparse
 import logging
 import os
 import shutil
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, Future, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import requests
@@ -77,7 +78,6 @@ def cleanup_runtime_artifacts() -> int:
     paths = [
         os.path.join(base_dir, "__pycache__"),
         os.path.join(base_dir, "tests", "__pycache__"),
-        getattr(config, "TEMP_DIR", os.path.join(base_dir, ".tmp_download")),
     ]
 
     if bool(getattr(config, "CLEAN_CHROME_CACHE_AFTER_SUCCESS", True)):
@@ -145,11 +145,7 @@ def _upload_one(item: dict, onedrive_path: str) -> tuple[dict, bool]:
         else:
             ok = onedrive.upload_file(local_path, onedrive_path)
         if ok:
-            # Remove temp file after successful upload
-            try:
-                os.remove(local_path)
-            except OSError:
-                pass
+            # Keep the download until the whole run succeeds so restart needs no download.
             logger.info(f"  ✅ Uploaded: {filename}")
         else:
             logger.error(f"  ❌ Upload failed: {filename}")
@@ -159,7 +155,14 @@ def _upload_one(item: dict, onedrive_path: str) -> tuple[dict, bool]:
         return (item, False)
 
 
-def run_backup(year: int, month: int) -> None:
+def run_backup(year: int, month: int) -> bool:
+    """Protect the shared browser profile and downloads across all entry points."""
+    datetime(year, month, 1)
+    with download_photos.runtime_lock():
+        return _run_backup(year, month)
+
+
+def _run_backup(year: int, month: int) -> bool:
     month_name = config.MONTHS[month]
     logger.info("=" * 60)
     logger.info(f"BACKUP STARTED: {month_name} {year}")
@@ -173,6 +176,7 @@ def run_backup(year: int, month: int) -> None:
 
     onedrive_path = onedrive_path_for_month(year, month)
     logger.info(f"OneDrive Destination: {onedrive_path}")
+    onedrive.verify_connection()
 
     # ── Pipeline: concurrent uploads start as photos are downloaded ──────────
     executor = ThreadPoolExecutor(
@@ -195,9 +199,10 @@ def run_backup(year: int, month: int) -> None:
         all_items = download_photos.download_photos_for_month(
             year, month, on_downloaded=on_photo_downloaded,
         )
-    except Exception as e:
+    except BaseException as e:
         logger.error(f"Error downloading from Google Photos: {e}")
-        executor.shutdown(wait=False)
+        # Workers must finish before releasing the lock or closing the process.
+        executor.shutdown(wait=True, cancel_futures=True)
         raise
 
     if not all_items:
@@ -209,7 +214,7 @@ def run_backup(year: int, month: int) -> None:
         else:
             logger.info("No photos found or downloaded for this month.")
         executor.shutdown()
-        return
+        return not download_errors
 
     logger.info(f"All {len(all_items)} photos downloaded. Waiting for remaining uploads...")
 
@@ -279,16 +284,10 @@ def run_backup(year: int, month: int) -> None:
 
     # Clean up generated runtime files only after a fully successful run.
     if total_error_count == 0:
+        download_photos.cleanup_completed_downloads(year, month, all_items)
         cleanup_runtime_artifacts()
     elif os.path.exists(temp_dir):
         logger.warning(f"Temporary files kept for inspection: {temp_dir}")
-
-    # Keep this fallback for configurations that disable the broad cleanup helper.
-    if total_error_count == 0 and os.path.exists(temp_dir):
-        try:
-            shutil.rmtree(temp_dir)
-        except Exception:
-            pass
 
     logger.info("=" * 60)
     logger.info(f"BACKUP COMPLETED: {month_name} {year}")
@@ -319,23 +318,31 @@ def run_backup(year: int, month: int) -> None:
             f"Deletion errors: {deletion_error_count}\n\n"
             f"Google Photos deletion was skipped unless DELETE_ON_PARTIAL_SUCCESS is enabled."
         )
+    return total_error_count == 0
 
 
 def main() -> None:
-    if len(sys.argv) == 3:
-        year = int(sys.argv[1])
-        month = int(sys.argv[2])
+    parser = argparse.ArgumentParser(description="Back up Google Photos to OneDrive")
+    parser.add_argument("year", nargs="?", type=int)
+    parser.add_argument("month", nargs="?", type=int)
+    args = parser.parse_args()
+    if (args.year is None) != (args.month is None):
+        parser.error("Provide both year and month, or neither")
+    if args.year is not None:
+        year, month = args.year, args.month
     else:
         # Default: previous month
         now = datetime.now()
         month = now.month - 1 if now.month > 1 else 12
         year = now.year if now.month > 1 else now.year - 1
 
-    if not 1 <= month <= 12:
-        logger.error(f"Invalid month: {month}")
+    try:
+        datetime(year, month, 1)
+        if not run_backup(year, month):
+            sys.exit(1)
+    except (ValueError, RuntimeError, OSError, requests.RequestException) as exc:
+        logger.error(f"Backup failed: {exc}")
         sys.exit(1)
-
-    run_backup(year, month)
 
 
 if __name__ == "__main__":

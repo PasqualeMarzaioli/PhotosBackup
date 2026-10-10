@@ -27,7 +27,7 @@
     <string>__PROJECT_PATH__</string>
 
     <key>StandardOutPath</key>
-    <string>__PROJECT_PATH__/backup.log</string>
+    <string>__PROJECT_PATH__/backup_stdout.log</string>
 
     <key>StandardErrorPath</key>
     <string>__PROJECT_PATH__/backup_error.log</string>

@@ -12,11 +12,16 @@ Google Photos Library API is not reliable for a full personal-library backup.
 """
 
 import calendar
+import fcntl
 import hashlib
+import json
 import os
+import re
 import sys
+import tempfile
 import time
 import urllib.parse
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -27,6 +32,79 @@ SESSION_DIR = os.path.join(BASE_DIR, ".chrome_session")
 TEMP_DIR = getattr(config, "TEMP_DIR", os.path.join(BASE_DIR, ".tmp_download"))
 
 _LAST_DOWNLOAD_ERRORS: list[str] = []
+
+
+@contextmanager
+def runtime_lock():
+    """Exclude overlapping backups and authentication on the shared profile."""
+    path = os.path.join(config.BASE_DIR, ".backup.lock")
+    with open(path, "a", encoding="utf-8") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Another backup or authentication session is already running") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _load_download_manifest(root: str) -> dict:
+    """Read resumable downloads without trusting paths outside their month."""
+    path = os.path.join(root, "downloads.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        entries = json.load(fh)
+    if not isinstance(entries, dict):
+        raise RuntimeError("Invalid download manifest; existing downloads were preserved")
+    for url, item in entries.items():
+        if not isinstance(item, dict) or not isinstance(item.get("local_path"), str):
+            raise RuntimeError("Invalid download manifest entry")
+        local_path = os.path.realpath(item["local_path"])
+        if os.path.commonpath([os.path.realpath(root), local_path]) != os.path.realpath(root):
+            raise RuntimeError("Download manifest points outside its month folder")
+        if _normalise_photo_url(url) != url or item.get("google_url") != url:
+            raise RuntimeError("Invalid Google Photos URL in download manifest")
+        if not isinstance(item.get("upload_filename"), str) or not re.fullmatch(r"[0-9a-f]{64}", item.get("sha256", "")):
+            raise RuntimeError("Invalid download filename or checksum in manifest")
+    return entries
+
+
+def _save_download_manifest(root: str, entries: dict) -> None:
+    """Record each completed download atomically before starting its upload."""
+    fd, path = tempfile.mkstemp(dir=root, prefix=".downloads-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(entries, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(path, os.path.join(root, "downloads.json"))
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def cleanup_completed_downloads(year: int, month: int, items: list[dict]) -> None:
+    """Remove only completed, registered files; preserve untracked downloads."""
+    root = os.path.join(TEMP_DIR, f"{year}_{month:02d}")
+    entries = _load_download_manifest(root)
+    for item in items:
+        url = item["google_url"]
+        saved = entries.get(url)
+        if saved and saved["local_path"] == item["local_path"]:
+            if os.path.exists(saved["local_path"]):
+                os.remove(saved["local_path"])
+            del entries[url]
+            # Empty run folders are disposable; older pending files are not.
+            try:
+                os.rmdir(os.path.dirname(saved["local_path"]))
+            except OSError:
+                pass
+    if entries:
+        _save_download_manifest(root, entries)
+    elif os.path.exists(os.path.join(root, "downloads.json")):
+        os.remove(os.path.join(root, "downloads.json"))
 
 
 def get_last_download_errors() -> list[str]:
@@ -67,6 +145,8 @@ def _normalise_photo_url(url: str) -> Optional[str]:
         return None
 
     parsed = urllib.parse.urlparse(url if url.startswith("http") else f"https://photos.google.com{url}")
+    if parsed.scheme != "https" or parsed.hostname != "photos.google.com":
+        return None
     photo_marker = "/photo/"
     marker_index = parsed.path.find(photo_marker)
     if marker_index < 0:
@@ -129,13 +209,20 @@ def _photo_urls_from_page(page) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
+_SCROLL_CONTAINER_JS = """
+    const candidates = Array.from(document.querySelectorAll('main, [role="main"], div'))
+        .filter(el => el.clientHeight > 0 && el.scrollHeight > el.clientHeight &&
+            /auto|scroll/.test(getComputedStyle(el).overflowY));
+    candidates.sort((a, b) => b.clientHeight * b.clientWidth - a.clientHeight * a.clientWidth);
+    const container = candidates[0] || document.scrollingElement;
+"""
+
+
 def _scroll_metrics(page) -> Optional[dict]:
-    script = """
-    () => ({
-        scrollY: window.scrollY,
-        innerHeight: window.innerHeight,
-        scrollHeight: document.documentElement.scrollHeight || document.body.scrollHeight || 0
-    })
+    script = "() => {" + _SCROLL_CONTAINER_JS + """
+        return {scrollY: container.scrollTop, innerHeight: container.clientHeight,
+            scrollHeight: container.scrollHeight};
+    }
     """
     try:
         metrics = page.evaluate(script)
@@ -146,7 +233,7 @@ def _scroll_metrics(page) -> Optional[dict]:
 
 def _scroll_down(page) -> None:
     try:
-        page.evaluate("() => window.scrollBy(0, Math.max(window.innerHeight * 0.9, 700))")
+        page.evaluate("() => {" + _SCROLL_CONTAINER_JS + "container.scrollBy(0, Math.max(container.clientHeight * 0.9, 200)); }")
     except Exception:
         page.keyboard.press("PageDown")
 
@@ -177,8 +264,6 @@ def _collect_urls_while_scrolling(page) -> list[str]:
     seen: set[str] = set()
     ordered: list[str] = []
     stable_rounds = 0
-    previous_scroll_y = None
-    previous_scroll_height = None
 
     for _ in range(max_scrolls):
         before_count = len(seen)
@@ -193,17 +278,10 @@ def _collect_urls_while_scrolling(page) -> list[str]:
             inner_height = float(metrics.get("innerHeight", 0) or 0)
             scroll_height = float(metrics.get("scrollHeight", 0) or 0)
             at_bottom = scroll_y + inner_height >= scroll_height - 40
-            did_not_move = (
-                previous_scroll_y == scroll_y
-                and previous_scroll_height == scroll_height
-            )
-            previous_scroll_y = scroll_y
-            previous_scroll_height = scroll_height
         else:
-            at_bottom = True
-            did_not_move = True
+            raise RuntimeError("Could not inspect Google Photos scroll position")
 
-        if len(seen) == before_count and (at_bottom or did_not_move):
+        if len(seen) == before_count and at_bottom:
             stable_rounds += 1
         else:
             stable_rounds = 0
@@ -213,12 +291,13 @@ def _collect_urls_while_scrolling(page) -> list[str]:
 
         _scroll_down(page)
         _wait(page, pause_seconds)
-
+    else:
+        _LAST_DOWNLOAD_ERRORS.append("Google Photos scrolling limit reached; month listing may be incomplete")
     return ordered
 
 
 def _next_unique_filename(filename: str, used_names: set[str]) -> str:
-    safe_name = os.path.basename(filename or "").strip() or "google-photo"
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", os.path.basename(filename or "")).strip().rstrip(". ") or "google-photo"
     root, ext = os.path.splitext(safe_name)
     candidate = safe_name
     counter = 2
@@ -257,7 +336,10 @@ def _download_one(page, photo_url: str, index: int, total: int, download_dir: st
     upload_filename = _next_unique_filename(original_filename, used_names)
     save_path = os.path.join(download_dir, upload_filename)
 
-    download.save_as(save_path)
+    # Partial files must never become resumable downloads after an interruption.
+    partial_path = save_path + ".part"
+    download.save_as(partial_path)
+    os.replace(partial_path, save_path)
     if not os.path.exists(save_path) or os.path.getsize(save_path) == 0:
         raise RuntimeError(f"Downloaded file is empty or missing: {upload_filename}")
 
@@ -291,9 +373,11 @@ def download_photos_for_month(
     _LAST_DOWNLOAD_ERRORS = []
 
     month_name = config.MONTHS[month]
+    datetime(year, month, 1)
     download_root = os.path.join(TEMP_DIR, f"{year}_{month:02d}")
-    download_dir = os.path.join(download_root, datetime.now().strftime("run_%Y%m%d_%H%M%S"))
-    os.makedirs(download_dir, exist_ok=True)
+    os.makedirs(download_root, exist_ok=True)
+    entries = _load_download_manifest(download_root)
+    download_dir = tempfile.mkdtemp(dir=download_root, prefix="run_")
     os.makedirs(SESSION_DIR, exist_ok=True)
 
     print(f"\n{'=' * 60}")
@@ -370,33 +454,36 @@ def download_photos_for_month(
 
             print(f"\n  Found {len(all_urls)} unique media links. Starting download...")
             downloaded_files: list[dict] = []
-            used_upload_names: set[str] = set()
-            downloaded_hashes: set[str] = set()
+            used_upload_names = {item["upload_filename"].casefold() for item in entries.values()}
             retries = max(1, int(_cfg("DOWNLOAD_RETRIES", 3)))
 
             for index, photo_url in enumerate(all_urls, 1):
                 last_error = None
+                cached = entries.get(photo_url)
+                if cached and os.path.isfile(cached["local_path"]) and _file_sha256(cached["local_path"]) == cached["sha256"]:
+                    print(f"  [{index}/{len(all_urls)}] Reusing download: {cached['upload_filename']}")
+                    downloaded_files.append(cached)
+                    if on_downloaded:
+                        on_downloaded(cached)
+                    continue
                 for attempt in range(1, retries + 1):
                     try:
                         item = _download_one(page, photo_url, index, len(all_urls), download_dir, used_upload_names)
                         file_hash = _file_sha256(item["local_path"])
-                        if file_hash in downloaded_hashes:
-                            print(f"SKIP DUPLICATE CONTENT: {item['original_filename']}")
-                            try:
-                                os.remove(item["local_path"])
-                            except OSError:
-                                pass
-                            last_error = None
-                            break
-
                         item["sha256"] = file_hash
-                        downloaded_hashes.add(file_hash)
+                        entries[photo_url] = item
+                        _save_download_manifest(download_root, entries)
+                        # Keep every source URL so deletion accounts for every item.
                         downloaded_files.append(item)
-                        if on_downloaded:
-                            on_downloaded(item)
                         last_error = None
                         break
                     except Exception as exc:
+                        # A terminated browser cannot recover by retrying another photo.
+                        if page.is_closed():
+                            raise RuntimeError(
+                                "Google Photos browser closed unexpectedly. Downloaded files were preserved; "
+                                "run ./backup.sh to resume."
+                            ) from exc
                         last_error = exc
                         if attempt < retries:
                             print(f"RETRY {attempt}/{retries}: {exc}")
@@ -406,6 +493,8 @@ def download_photos_for_month(
 
                 if last_error is not None:
                     _LAST_DOWNLOAD_ERRORS.append(f"{photo_url}: {last_error}")
+                elif on_downloaded:
+                    on_downloaded(item)
 
         finally:
             context.close()
@@ -459,12 +548,13 @@ def delete_photos_from_google(items: list[dict]) -> dict:
                 tabs = []
                 for item in batch:
                     url = item.get("google_url")
-                    if not url:
+                    if not url or _normalise_photo_url(url) is None:
                         error_count += 1
                         continue
                     tab = context.new_page()
                     tabs.append((tab, item, url))
 
+                ready_tabs = []
                 for tab, item, url in tabs:
                     try:
                         tab.goto(
@@ -473,33 +563,31 @@ def delete_photos_from_google(items: list[dict]) -> dict:
                             timeout=int(_cfg("PHOTO_NAVIGATION_TIMEOUT_MS", 60000)),
                         )
                         _mute_media_on_page(tab)
+                        if _photo_key(tab.url) != _photo_key(url):
+                            raise RuntimeError("Google Photos did not open the requested media item")
+                        ready_tabs.append((tab, item, url))
                     except Exception as exc:
                         print(f"  Navigation error: {exc}")
+                        error_count += 1
 
                 if tabs:
                     _wait(tabs[0][0], 2.0)
 
-                for idx, (tab, item, url) in enumerate(tabs):
+                for idx, (tab, item, url) in enumerate(ready_tabs):
                     item_num = batch_start + idx + 1
                     try:
                         print(f"  [{item_num}/{len(items)}] Deleting...", end=" ", flush=True)
                         tab.keyboard.press("#")
-                        _wait(tab, 0.5)
-                        tab.keyboard.press("Enter")
-
-                        deletion_verified = False
-                        for _ in range(5):
-                            _wait(tab, 1.0)
-                            if tab.url != url:
-                                deletion_verified = True
-                                break
-
-                        if deletion_verified:
-                            print("DONE")
-                            deleted_count += 1
-                        else:
-                            print("FAILED (URL did not change)")
-                            error_count += 1
+                        dialog = tab.get_by_role("dialog")
+                        dialog.wait_for(state="visible", timeout=10000)
+                        dialog.get_by_role("button", name=re.compile(r"^(Move to trash|Sposta nel cestino|Delete|Elimina)$", re.I)).click()
+                        dialog.wait_for(state="hidden", timeout=10000)
+                        tab.wait_for_url(
+                            lambda actual: urllib.parse.urlparse(actual).hostname == "photos.google.com" and _photo_key(actual) != _photo_key(url),
+                            timeout=10000,
+                        )
+                        print("DONE")
+                        deleted_count += 1
                     except Exception as exc:
                         print(f"ERROR: {exc}")
                         error_count += 1
@@ -535,6 +623,7 @@ if __name__ == "__main__":
         print(f"Invalid month: {month}")
         sys.exit(1)
 
-    files = download_photos_for_month(year, month)
+    with runtime_lock():
+        files = download_photos_for_month(year, month)
     if files:
         print(f"Downloaded {len(files)} files to .tmp_download/{year}_{month:02d}/")

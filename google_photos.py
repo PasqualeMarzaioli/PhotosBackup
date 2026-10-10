@@ -7,15 +7,14 @@ Module for accessing the Google Photos Library API.
 Handles OAuth2 authentication and retrieval of media items per month.
 """
 
-import os
-import logging
-import requests
 import calendar
+import logging
+import os
 from typing import Optional
 
-from google.oauth2.credentials import Credentials
+import requests
 from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2.credentials import Credentials
 
 import config
 

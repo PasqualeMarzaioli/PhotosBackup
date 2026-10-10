@@ -18,7 +18,7 @@ Immagini/Memorie/{year}/{mm.MonthName year}
 
 ## Requirements
 
-- macOS with Python 3.9+
+- macOS with Python 3.10+ (Python 3.11 recommended)
 - Google account with Google Photos
 - Microsoft account with personal OneDrive
 - A Microsoft app registration for OneDrive access
@@ -33,7 +33,7 @@ The active downloader uses a real Chrome session because Google Photos browser d
 Run:
 
 ```bash
-python3 setup_auth.py
+venv/bin/python setup_auth.py
 ```
 
 Chrome opens and asks you to sign in to Google Photos. Once the library is visible, return to the terminal and continue. The browser profile is saved in `.chrome_session/` and reused by future backups.
@@ -90,8 +90,16 @@ The browser downloader and OneDrive uploader are intentionally conservative:
 - `MUTE_BROWSER_AUDIO`: Opens Google Photos media pages without video/audio playback sound.
 - `DELETE_AFTER_UPLOAD`: Enables automatic deletion from Google Photos after a successful backup.
 - `DELETE_ON_PARTIAL_SUCCESS`: Defaults to `False`; when a run has download or upload errors, Google Photos deletion is skipped.
-- `CLEAN_RUNTIME_ARTIFACTS_AFTER_SUCCESS`: Removes temporary files and Python caches after a fully successful run.
+- `CLEAN_RUNTIME_ARTIFACTS_AFTER_SUCCESS`: Removes Python caches after a fully successful run. Completed registered downloads are cleaned independently.
 - `CLEAN_CHROME_CACHE_AFTER_SUCCESS`: Removes Chrome cache folders while preserving the saved Google login session.
+
+OneDrive authentication and drive access are checked before downloading. The access token is reused between uploads and refreshed when needed. HTTP connections are reused per upload worker. Transient network failures and rate limits are retried; upload sessions recover the server offset when a retried chunk was already received.
+
+Every OneDrive copy is verified by SHA-256 before its Google Photos source can be deleted. When Graph does not expose SHA-256, the remote file is streamed back for comparison. This adds download traffic but avoids treating different files with the same name and size as identical. Upload sessions use conflict behavior `fail` to preserve existing files.
+
+Completed downloads are recorded atomically in `.tmp_download/{year}_{month}/downloads.json`. A retry reuses a local file only when its checksum matches the record. Files stay local until the complete run succeeds. Cleanup removes only registered files from that run; untracked files and other months are preserved. An operating-system lock prevents simultaneous backups and authentication sessions from sharing the browser profile.
+
+If the scroll limit is reached, the run is marked incomplete and deletion is skipped by default. The browser automation depends on the Google Photos interface; deletion confirmation currently supports English and Italian dialogs. Unsupported dialogs fail without pressing a generic confirmation key.
 
 ---
 
@@ -104,7 +112,7 @@ cd /Users/your_user/path/to/PhotosBackup
 bash install.sh
 
 # Authenticate (opens the browser)
-python3 setup_auth.py
+venv/bin/python setup_auth.py
 ```
 
 ---
@@ -116,7 +124,27 @@ python3 setup_auth.py
 | `./backup.sh` | Backup for the previous month |
 | `./backup.sh 2026 3` | Backup for March 2026 |
 | `./check_and_backup.sh` | Run the catch-up checker |
-| `python3 setup_auth.py` | Re-authentication (expired token) |
+| `venv/bin/python setup_auth.py` | Re-authentication (expired or revoked session) |
+
+If Microsoft reports `AADSTS70000` or `invalid_grant`, a new sign-in is required. To re-authenticate only Microsoft while keeping the Google session:
+
+```bash
+venv/bin/python - <<'PY'
+# Renew Microsoft authentication without opening Google Photos.
+# Author: Pasquale Marzaioli
+from download_photos import runtime_lock
+from setup_auth import setup_microsoft
+
+with runtime_lock():
+    setup_microsoft()
+PY
+```
+
+Then run `./backup.sh`. Failed backups exit with a nonzero status; the daily checker retries when no completed run with zero errors is recorded.
+
+The installer uses the project virtual environment for dependencies, authentication and the LaunchAgent. It does not modify system Python. Google Chrome is required because the saved session uses the Chrome channel.
+
+After updating the scripts, run `bash install.sh` to refresh an existing LaunchAgent. Browser output is written to `backup_stdout.log`, while structured backup summaries remain in `backup.log`; this prevents duplicate log entries. The checker also understands older duplicated summaries.
 
 ### LaunchAgent Management
 
@@ -178,13 +206,25 @@ All backups are recorded in `backup.log`:
 
 ## Important Notes
 
-- Microsoft tokens are automatically renewed without requiring a new login.
-- Files already present on OneDrive with the same name and size are skipped.
-- Same-name files with different sizes are uploaded with a numbered suffix instead of being silently skipped.
+- Microsoft access tokens are renewed automatically while the refresh authorization remains valid. Expired or revoked authorization requires manual sign-in.
+- Files already present on OneDrive are skipped only after their content is verified.
+- Same-name files with different contents use a stable checksum suffix instead of being overwritten or silently skipped.
 - Google Photos URLs are canonicalized so the same media item is not downloaded repeatedly from different browser routes.
-- Duplicate downloaded content is detected by SHA-256 and skipped before upload.
+- Every Google source URL is tracked, including items with duplicate contents, so no source disappears from backup accounting.
 - Google Photos video/audio pages are opened muted when `MUTE_BROWSER_AUDIO = True`.
 - If the Mac is turned off on the scheduled day, the daily checker catches up when the Mac is available again.
 - Google Photos deletion is skipped when any download or upload error occurs, unless `DELETE_ON_PARTIAL_SUCCESS` is explicitly enabled.
-- Temporary files are automatically deleted only after a fully successful run; failed runs keep them for inspection.
-- After a fully successful run, runtime cleanup removes `.tmp_download`, Python bytecode caches, and Chrome cache directories without deleting tokens, logs, configuration, the virtual environment, or the browser login session.
+- Registered temporary files are deleted only after a fully successful run; failed runs keep them for restart. Downloads made before the manifest feature remain preserved because they cannot be reliably mapped to source URLs.
+- Runtime cleanup removes Python bytecode caches and optional Chrome caches. It preserves tokens, logs, configuration, the virtual environment, browser login state, untracked downloads and pending downloads from other months.
+
+## Verification
+
+```bash
+venv/bin/python -m unittest discover -s tests -v
+venv/bin/python -m compileall -q backup.py download_photos.py onedrive.py setup_auth.py google_photos.py tests
+venv/bin/python -m pip check
+bash -n backup.sh check_and_backup.sh install.sh promemoria.sh
+plutil -lint com.pasquale.photosbackup.plist.example
+```
+
+The tests mock cloud services and cover authentication failures, interrupted uploads, content collisions, download restart, process locking and deletion safety. They do not upload or delete personal photos. If Ruff is installed in the environment, lint with `venv/bin/ruff check --isolated --select E4,E7,E9,F,I . --exclude venv`.

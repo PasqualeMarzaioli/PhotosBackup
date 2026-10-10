@@ -7,15 +7,17 @@ Module for uploading to Microsoft OneDrive via Microsoft Graph API.
 Handles MSAL authentication and file uploads (including large files with upload sessions).
 """
 
-import os
+import hashlib
 import logging
-import requests
+import os
+import tempfile
 import threading
 import time
 import urllib.parse
 from typing import Optional
 
 import msal
+import requests
 
 import config
 
@@ -29,9 +31,10 @@ _folder_id_cache = {}
 _folder_id_cache_lock = threading.Lock()
 _folder_creation_lock = threading.Lock()
 _token_lock = threading.Lock()
+_access_token = None
+_token_expires_at = 0
+_http = threading.local()
 
-# Threshold to use upload session (files > 4 MB)
-_LARGE_FILE_THRESHOLD = 4 * 1024 * 1024
 _RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 
 
@@ -39,42 +42,66 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
     """Run an HTTP request with retries for transient Graph/network failures."""
     attempts = max(1, int(getattr(config, "REQUEST_RETRIES", 5)))
     backoff = float(getattr(config, "REQUEST_RETRY_BACKOFF_SECONDS", 2.0))
-    request_func = getattr(requests, method.lower())
-    last_exc = None
+    if not hasattr(_http, "session"):
+        _http.session = requests.Session()
+    refreshed = False
 
     for attempt in range(1, attempts + 1):
         try:
-            resp = request_func(url, **kwargs)
+            resp = _http.session.request(method, url, **kwargs)
         except requests.RequestException as exc:
-            last_exc = exc
             if attempt == attempts:
-                raise
+                raise RuntimeError(f"{method} request failed after {attempts} attempts ({type(exc).__name__})") from None
             sleep_for = min(backoff * attempt, 30)
-            logger.warning(f"{method} {url} failed ({exc}); retrying in {sleep_for:.1f}s")
+            # Upload URLs contain credentials; never include them in logs.
+            logger.warning(f"{method} request failed ({type(exc).__name__}); retrying in {sleep_for:.1f}s")
             time.sleep(sleep_for)
             continue
+
+        if resp.status_code == 401 and url.startswith(_GRAPH_BASE + "/") and not refreshed:
+            resp.close()
+            kwargs["headers"] = {**kwargs.get("headers", {}), **_headers(_get_token(force_refresh=True))}
+            refreshed = True
+            resp = _http.session.request(method, url, **kwargs)
 
         if resp.status_code not in _RETRY_STATUSES or attempt == attempts:
             return resp
 
         retry_after = resp.headers.get("Retry-After")
         try:
-            sleep_for = float(retry_after) if retry_after else min(backoff * attempt, 30)
+            sleep_for = max(0, float(retry_after)) if retry_after else min(backoff * attempt, 30)
         except ValueError:
             sleep_for = min(backoff * attempt, 30)
         logger.warning(
-            f"{method} {url} returned {resp.status_code}; retrying in {sleep_for:.1f}s"
+            f"{method} request returned {resp.status_code}; retrying in {sleep_for:.1f}s"
         )
+        resp.close()
         time.sleep(sleep_for)
 
-    if last_exc:
-        raise last_exc
-    raise RuntimeError(f"{method} {url} failed without a response")
+    raise RuntimeError(f"{method} request failed without a response")
 
 
-def _get_token() -> str:
+def _save_token_cache(cache) -> None:
+    """Replace the credential cache atomically with owner-only permissions."""
+    os.makedirs(config.TOKENS_DIR, mode=0o700, exist_ok=True)
+    fd, path = tempfile.mkstemp(dir=config.TOKENS_DIR, prefix=".microsoft-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(cache.serialize())
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(path, config.MICROSOFT_TOKEN_FILE)
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def _get_token(force_refresh: bool = False) -> str:
     """Retrieve a valid Microsoft access token using MSAL with persistent cache."""
+    global _access_token, _token_expires_at
     with _token_lock:
+        if not force_refresh and _access_token and time.time() < _token_expires_at:
+            return _access_token
         cache = msal.SerializableTokenCache()
 
         if os.path.exists(config.MICROSOFT_TOKEN_FILE):
@@ -85,27 +112,36 @@ def _get_token() -> str:
             client_id=config.MICROSOFT_CLIENT_ID,
             authority=_AUTHORITY,
             token_cache=cache,
+            timeout=30,
         )
 
         accounts = app.get_accounts()
         result = None
 
         if accounts:
-            result = app.acquire_token_silent(config.MICROSOFT_SCOPES, account=accounts[0])
+            result = app.acquire_token_silent_with_error(
+                config.MICROSOFT_SCOPES, account=accounts[0], force_refresh=force_refresh,
+            )
 
         if not result or "access_token" not in result:
-            raise RuntimeError(
-                "Microsoft token not found or expired. "
-                "Run first: python setup_auth.py"
-            )
+            _access_token = None
+            reason = (result or {}).get("error_description") or (result or {}).get("error") or "No cached account or refresh token"
+            raise RuntimeError(f"Microsoft authentication failed: {reason}. Run venv/bin/python setup_auth.py manually.")
 
         # Save updated cache
         if cache.has_state_changed:
-            os.makedirs(config.TOKENS_DIR, exist_ok=True)
-            with open(config.MICROSOFT_TOKEN_FILE, "w") as f:
-                f.write(cache.serialize())
+            _save_token_cache(cache)
 
-        return result["access_token"]
+        _access_token = result["access_token"]
+        _token_expires_at = time.time() + max(0, int(result.get("expires_in", 300)) - 60)
+        return _access_token
+
+
+def verify_connection() -> dict:
+    """Check authentication and drive access before downloading any media."""
+    resp = _request("GET", f"{_GRAPH_BASE}/me/drive", headers=_headers(_get_token()), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _headers(token: str) -> dict:
@@ -163,7 +199,10 @@ def _ensure_folder(token: str, folder_path: str) -> str:
                     for retry in range(5):
                         resp = _request("GET", url, headers=_headers(token), timeout=30)
                         if resp.status_code == 200:
-                            parent_id = resp.json()["id"]
+                            item = resp.json()
+                            if "folder" not in item:
+                                raise RuntimeError(f"OneDrive path is not a folder: {path_so_far}")
+                            parent_id = item["id"]
                             break
                         time.sleep(0.5 * (retry + 1))
                     else:
@@ -179,27 +218,8 @@ def _ensure_folder(token: str, folder_path: str) -> str:
         return parent_id
 
 
-def _upload_small(token: str, folder_id: str, filename: str, filepath: str) -> bool:
-    """Simple upload for files <= 4 MB."""
-    encoded_filename = urllib.parse.quote(filename, safe="")
-    url = f"{_GRAPH_BASE}/me/drive/items/{folder_id}:/{encoded_filename}:/content"
-    with open(filepath, "rb") as f:
-        data = f.read()
-    resp = _request(
-        "PUT",
-        url,
-        headers={**_headers(token), "Content-Type": "application/octet-stream"},
-        data=data,
-        timeout=120,
-    )
-    if resp.status_code in (200, 201):
-        return True
-    logger.error(f"Upload failed ({resp.status_code}): {resp.text[:200]}")
-    return False
-
-
 def _upload_large(token: str, folder_id: str, filename: str, filepath: str) -> bool:
-    """Upload session for files > 4 MB."""
+    """Use conflict-safe upload sessions for both photos and large videos."""
     file_size = os.path.getsize(filepath)
 
     # Create upload session
@@ -222,6 +242,8 @@ def _upload_large(token: str, folder_id: str, filename: str, filepath: str) -> b
     with open(filepath, "rb") as f:
         while uploaded < file_size:
             chunk = f.read(chunk_size)
+            if not chunk:
+                raise RuntimeError("Local file changed during upload")
             end = uploaded + len(chunk) - 1
             headers = {
                 "Content-Length": str(len(chunk)),
@@ -229,14 +251,32 @@ def _upload_large(token: str, folder_id: str, filename: str, filepath: str) -> b
             }
             resp = _request("PUT", upload_url, headers=headers, data=chunk, timeout=120)
 
+            if resp.status_code == 416:
+                # A timed-out request may have committed its chunk before a retry.
+                status = _request("GET", upload_url, timeout=30)
+                if status.status_code != 200:
+                    return False
+                ranges = status.json().get("nextExpectedRanges", [])
+                if not ranges:
+                    return False
+                offset = min(int(value.split("-", 1)[0]) for value in ranges)
+                if not uploaded < offset < file_size:
+                    return False
+                uploaded = offset
+                f.seek(uploaded)
+                continue
+
             if resp.status_code not in (200, 201, 202):
-                logger.error(f"Chunk upload failed ({resp.status_code}): {resp.text[:200]}")
+                logger.error(f"Chunk upload failed ({resp.status_code})")
                 return False
 
             uploaded += len(chunk)
+            if resp.status_code in (200, 201):
+                return uploaded == file_size and resp.json().get("size") == file_size
             logger.debug(f"Upload {filename}: {uploaded}/{file_size} bytes")
 
-    return True
+    logger.error("Upload session did not confirm completion")
+    return False
 
 
 def get_file_metadata_on_onedrive(token: str, folder_id: str, filename: str) -> Optional[dict]:
@@ -262,40 +302,46 @@ def _candidate_filename(filename: str, suffix: int) -> str:
     return f"{root} ({suffix}){ext}"
 
 
-def _select_remote_filename(token: str, folder_id: str, filename: str, file_size: int) -> Optional[str]:
-    """
-    Return the remote filename to upload, or None when the same name and size
-    already exist and can be treated as backed up.
-    """
-    metadata = get_file_metadata_on_onedrive(token, folder_id, filename)
-    if metadata is None:
-        return filename
+def _matches_content(token: str, metadata: dict, file_size: int, sha256: str) -> bool:
+    """Compare content, streaming it when Graph does not provide SHA-256."""
+    if metadata.get("size") != file_size or "file" not in metadata:
+        return False
+    remote_hash = metadata["file"].get("hashes", {}).get("sha256Hash")
+    if remote_hash:
+        return remote_hash.lower() == sha256.lower()
+    digest = hashlib.sha256()
+    count = 0
+    url = f"{_GRAPH_BASE}/me/drive/items/{metadata['id']}/content"
+    with _request("GET", url, headers=_headers(token), stream=True, timeout=120) as resp:
+        if resp.status_code != 200:
+            raise RuntimeError(f"OneDrive content download failed (HTTP {resp.status_code})")
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            digest.update(chunk)
+            count += len(chunk)
+    return count == file_size and digest.hexdigest() == sha256.lower()
 
-    remote_size = metadata.get("size")
-    if remote_size == file_size:
-        logger.info(f"Already on OneDrive with same size, skipping: {filename}")
-        return None
 
-    for suffix in range(2, 100):
-        candidate = _candidate_filename(filename, suffix)
-        if get_file_metadata_on_onedrive(token, folder_id, candidate) is None:
-            logger.warning(
-                f"Name collision on OneDrive for {filename}; uploading as {candidate}"
-            )
-            return candidate
-
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
+def _select_remote_filename(token: str, folder_id: str, filename: str, file_size: int, sha256: str) -> Optional[str]:
+    """Reuse only verified content; give collisions a stable content suffix."""
     root, ext = os.path.splitext(filename)
-    candidate = f"{root} ({timestamp}){ext}"
-    logger.warning(f"Many OneDrive name collisions for {filename}; uploading as {candidate}")
-    return candidate
+    collision_name = f"{root} ({sha256[:16]}){ext}"
+    candidates = [filename, collision_name]
+    candidates.extend(_candidate_filename(collision_name, suffix) for suffix in range(2, 100))
+    for candidate in candidates:
+        metadata = get_file_metadata_on_onedrive(token, folder_id, candidate)
+        if metadata is None:
+            return candidate
+        if _matches_content(token, metadata, file_size, sha256):
+            logger.info(f"Verified existing OneDrive copy: {candidate}")
+            return None
+    raise RuntimeError(f"Too many OneDrive filename collisions: {filename}")
 
 
 def upload_file(filepath: str, onedrive_folder_path: str, target_filename: Optional[str] = None) -> bool:
     """
     Uploads a file to OneDrive in the specified folder.
     Automatically creates intermediate folders if needed.
-    Skips the file if the same name and size already exist.
+    Returns success only after verifying the remote file's content.
     """
     token = _get_token()
     if not os.path.exists(filepath):
@@ -304,16 +350,32 @@ def upload_file(filepath: str, onedrive_folder_path: str, target_filename: Optio
 
     filename = os.path.basename(target_filename or filepath)
     file_size = os.path.getsize(filepath)
+    if file_size == 0:
+        logger.error(f"Refusing to upload an empty file: {filename}")
+        return False
+    digest = hashlib.sha256()
+    with open(filepath, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    sha256 = digest.hexdigest()
 
     folder_id = _ensure_folder(token, onedrive_folder_path)
 
-    remote_filename = _select_remote_filename(token, folder_id, filename, file_size)
+    remote_filename = _select_remote_filename(token, folder_id, filename, file_size, sha256)
     if remote_filename is None:
         return True
 
     logger.info(f"Uploading: {remote_filename} ({file_size / 1024 / 1024:.1f} MB)")
 
-    if file_size <= _LARGE_FILE_THRESHOLD:
-        return _upload_small(token, folder_id, remote_filename, filepath)
-    else:
-        return _upload_large(token, folder_id, remote_filename, filepath)
+    try:
+        # A lost final acknowledgement is harmless if the committed content matches.
+        _upload_large(token, folder_id, remote_filename, filepath)
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 409:
+            raise
+        # A concurrent writer may have completed the identical file first.
+    metadata = get_file_metadata_on_onedrive(_get_token(), folder_id, remote_filename)
+    verified = metadata is not None and _matches_content(_get_token(), metadata, file_size, sha256)
+    if not verified:
+        logger.error(f"OneDrive content verification failed: {remote_filename}")
+    return verified

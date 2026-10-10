@@ -10,14 +10,11 @@ Run ONCE:
     python setup_auth.py
 """
 
-import json
 import os
 import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
 
 import msal
-import requests
+
 import config
 
 
@@ -26,8 +23,9 @@ def setup_google() -> None:
     print("  GOOGLE PHOTOS SETUP")
     print("=" * 55)
 
-    import download_photos
     from playwright.sync_api import sync_playwright
+
+    import download_photos
 
     os.makedirs(download_photos.SESSION_DIR, exist_ok=True)
     with sync_playwright() as p:
@@ -37,13 +35,17 @@ def setup_google() -> None:
             headless=False,
             args=["--disable-blink-features=AutomationControlled"],
         )
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto("https://photos.google.com/")
-        print("\n  A Chrome window has opened.")
-        print("  Log in to your Google account if requested.")
-        print("  When you see your photo library, come back here and press ENTER.")
-        input("  Press ENTER to continue...")
-        context.close()
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto("https://photos.google.com/")
+            print("\n  A Chrome window has opened.")
+            print("  Log in to your Google account if requested.")
+            print("  When you see your photo library, come back here and press ENTER.")
+            input("  Press ENTER to continue...")
+            if "accounts.google.com" in page.url or "signin" in page.url.lower():
+                raise RuntimeError("Google Photos login was not completed")
+        finally:
+            context.close()
     
     print("\nGoogle Photos: AUTHENTICATION COMPLETED")
 
@@ -75,15 +77,15 @@ def setup_microsoft() -> None:
     if "access_token" not in result:
         raise RuntimeError(f"Microsoft authentication failed: {result.get('error_description')}")
 
-    os.makedirs(config.TOKENS_DIR, exist_ok=True)
-    with open(config.MICROSOFT_TOKEN_FILE, "w") as f:
-        f.write(cache.serialize())
+    import onedrive
+    onedrive._save_token_cache(cache)
+    onedrive._access_token = None
 
     print(f"\nMicrosoft token saved to: {config.MICROSOFT_TOKEN_FILE}")
     print("Microsoft OneDrive: AUTHENTICATION COMPLETED")
 
 
-def verify_setup() -> None:
+def verify_setup() -> bool:
     print("\n" + "=" * 55)
     print("  VERIFY CONNECTIONS ")
     print("=" * 55)
@@ -96,23 +98,20 @@ def verify_setup() -> None:
         print("  Google Photos : ERROR (No session found)")
 
     # Verify Microsoft
+    verified = False
     try:
         import onedrive
-        token = onedrive._get_token()
-        resp = requests.get(
-            "https://graph.microsoft.com/v1.0/me/drive",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        drive_name = resp.json().get("name", "OneDrive")
+        drive_name = onedrive.verify_connection().get("name", "OneDrive")
         print(f"  Microsoft     : OK  ({drive_name})")
+        verified = os.path.exists(download_photos.SESSION_DIR)
     except Exception as e:
         print(f"  Microsoft     : ERROR - {e}")
 
     print()
+    return verified
 
 
-if __name__ == "__main__":
+def main() -> None:
     print("\nWelcome to the Google Photos -> OneDrive Backup Setup")
 
     # Check for placeholder Microsoft credentials
@@ -133,5 +132,12 @@ if __name__ == "__main__":
         print(f"\nMicrosoft Error: {e}")
         exit(1)
 
-    verify_setup()
+    if not verify_setup():
+        raise RuntimeError("Setup verification failed")
     print("Setup completed! The daily checker can now run the monthly backup when needed.")
+
+
+if __name__ == "__main__":
+    import download_photos
+    with download_photos.runtime_lock():
+        main()

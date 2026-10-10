@@ -12,6 +12,10 @@ venv/
 .chrome_session/
 .tmp_download/
 backup.log
+backup_error.log
+backup_stdout.log
+.backup.lock
+.ruff_cache/
 debug_screenshot.png
 
 # Configuration (contains secrets)

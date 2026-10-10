@@ -4,15 +4,16 @@ Tests the optional Google Photos Library API helpers.
 Author: Pasquale Marzaioli
 """
 
-import unittest
-from unittest.mock import patch, mock_open, MagicMock
 import os
 import sys
+import unittest
+from unittest.mock import MagicMock, mock_open, patch
 
 # Add project path to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import google_photos
+import google_photos  # noqa: E402
+
 
 class TestGooglePhotos(unittest.TestCase):
 
